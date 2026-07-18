@@ -14,7 +14,7 @@ import (
 var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Initialize the system: apt update, upgrade and common tools",
-	Long: `Initialize a fresh Ubuntu server:
+	Long: `Initialize a fresh Linux server (currently Ubuntu 24.04 / 26.04):
 
   1. apt-get update
   2. apt-get upgrade -y (non-interactive)
@@ -45,7 +45,7 @@ Runs with sudo automatically when not invoked as root.`,
 	},
 }
 
-// checkOS rejects anything but the supported Ubuntu releases before a
+// checkOS rejects anything but the supported distributions before a
 // single system command is run.
 func checkOS() error {
 	if runtime.GOOS != "linux" {

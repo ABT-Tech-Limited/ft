@@ -9,9 +9,12 @@ import (
 
 var rootCmd = &cobra.Command{
 	Use:   "ft",
-	Short: "ft wraps common Linux ops commands for Ubuntu servers",
+	Short: "ft wraps common ops commands for Linux servers",
 	Long: `ft wraps common Linux ops commands (system init, service setup, ...)
-into one-shot subcommands. Supported systems: Ubuntu 24.04 / 26.04.`,
+into one-shot subcommands.
+
+Designed for Linux servers of all major distributions; currently
+supports Ubuntu 24.04 / 26.04, with more distributions to come.`,
 	SilenceUsage: true,
 }
 

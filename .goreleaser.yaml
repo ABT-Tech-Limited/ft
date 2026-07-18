@@ -11,7 +11,7 @@ before:
 builds:
   - env:
       - CGO_ENABLED=0
-    # ft only targets Ubuntu servers.
+    # ft targets Linux servers only.
     goos:
       - linux
     goarch:

@@ -1,4 +1,4 @@
-// ft is a CLI that wraps common Linux ops commands for Ubuntu servers.
+// ft is a CLI that wraps common ops commands for Linux servers.
 package main
 
 import (
