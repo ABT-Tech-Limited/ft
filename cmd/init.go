@@ -36,7 +36,7 @@ Runs with sudo automatically when not invoked as root.`,
 		}
 		for i, step := range steps {
 			fmt.Printf("\n==> [%d/%d] %s\n", i+1, len(steps), step.title)
-			if err := aptx.Run(step.argv); err != nil {
+			if err := aptx.RunContext(cmd.Context(), step.argv); err != nil {
 				return fmt.Errorf("%s failed: %w", strings.ToLower(step.title[:1])+step.title[1:], err)
 			}
 		}
@@ -45,17 +45,27 @@ Runs with sudo automatically when not invoked as root.`,
 	},
 }
 
-// checkOS rejects anything but the supported distributions before a
-// single system command is run.
-func checkOS() error {
+// detectOS returns the supported distribution before a single system command
+// is run.
+func detectOS() (osrelease.Info, error) {
 	if runtime.GOOS != "linux" {
-		return fmt.Errorf("unsupported system: %s (supported: Ubuntu 24.04, Ubuntu 26.04)", runtime.GOOS)
+		return osrelease.Info{}, fmt.Errorf("unsupported system: %s (supported: Ubuntu 24.04, Ubuntu 26.04)", runtime.GOOS)
 	}
 	data, err := os.ReadFile(osrelease.Path)
 	if err != nil {
-		return fmt.Errorf("cannot detect OS from %s: %w (supported: Ubuntu 24.04, Ubuntu 26.04)", osrelease.Path, err)
+		return osrelease.Info{}, fmt.Errorf("cannot detect OS from %s: %w (supported: Ubuntu 24.04, Ubuntu 26.04)", osrelease.Path, err)
 	}
-	return osrelease.Parse(string(data)).Supported()
+	info := osrelease.Parse(string(data))
+	if err := info.Supported(); err != nil {
+		return osrelease.Info{}, err
+	}
+	return info, nil
+}
+
+// checkOS preserves the init command's validation-only interface.
+func checkOS() error {
+	_, err := detectOS()
+	return err
 }
 
 func init() {

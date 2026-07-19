@@ -5,8 +5,10 @@
 package aptx
 
 import (
-	"os"
-	"os/exec"
+	"context"
+	"io"
+
+	"github.com/ABT-Tech-Limited/ft/internal/sysx"
 )
 
 // DefaultPackages is the tool set installed by `ft init`.
@@ -52,20 +54,22 @@ func Install(pkgs ...string) []string {
 // WithSudo prefixes argv with sudo, forwarding DEBIAN_FRONTEND across
 // the sudo boundary. The input slice is not modified.
 func WithSudo(argv []string) []string {
-	return append([]string{"sudo", "DEBIAN_FRONTEND=noninteractive"}, argv...)
+	return sysx.WithSudo(argv)
 }
 
 // Run executes argv with output streamed to the terminal. When not
 // running as root the command is wrapped with sudo (stdin stays
 // attached so sudo can prompt for a password).
 func Run(argv []string) error {
-	if os.Geteuid() != 0 {
-		argv = WithSudo(argv)
-	}
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
-	return cmd.Run()
+	return sysx.Run(argv)
+}
+
+// RunContext executes argv with output streamed to the terminal.
+func RunContext(ctx context.Context, argv []string) error {
+	return sysx.RunContext(ctx, argv)
+}
+
+// RunInputContext executes argv with custom stdin and terminal output.
+func RunInputContext(ctx context.Context, argv []string, stdin io.Reader) error {
+	return sysx.RunInputContext(ctx, argv, stdin)
 }

@@ -105,6 +105,38 @@ func TestInfoSupported(t *testing.T) {
 	}
 }
 
+func TestInfoCodename(t *testing.T) {
+	tests := []struct {
+		name    string
+		info    Info
+		want    string
+		wantErr bool
+	}{
+		{name: "Ubuntu 24.04", info: Info{ID: "ubuntu", VersionID: "24.04"}, want: "noble"},
+		{name: "Ubuntu 26.04", info: Info{ID: "ubuntu", VersionID: "26.04"}, want: "resolute"},
+		{name: "unsupported version", info: Info{ID: "ubuntu", VersionID: "22.04"}, wantErr: true},
+		{name: "unsupported distribution", info: Info{ID: "debian", VersionID: "24.04"}, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.info.Codename()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("Codename() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Codename() error = %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("Codename() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseRejectsNonMatchingOS(t *testing.T) {
 	if err := Parse(debian12).Supported(); err == nil {
 		t.Fatal("debian must not be supported")

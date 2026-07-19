@@ -4,16 +4,19 @@ package osrelease
 
 import (
 	"fmt"
-	"slices"
 	"strings"
 )
 
 // Path is the standard location of the os-release file on Linux.
 const Path = "/etc/os-release"
 
-// supported maps distribution ID to the version IDs ft supports.
-var supported = map[string][]string{
-	"ubuntu": {"24.04", "26.04"},
+// supported maps distribution and version IDs to their apt repository
+// codenames, keeping release support metadata in one place.
+var supported = map[string]map[string]string{
+	"ubuntu": {
+		"24.04": "noble",
+		"26.04": "resolute",
+	},
 }
 
 // Info holds the fields ft cares about from an os-release file.
@@ -52,12 +55,18 @@ func Parse(data string) Info {
 // It returns nil when supported, otherwise an error naming the detected
 // system and the supported ones.
 func (i Info) Supported() error {
-	if slices.Contains(supported[i.ID], i.VersionID) {
-		return nil
+	_, err := i.Codename()
+	return err
+}
+
+// Codename returns the apt repository codename for a supported release.
+func (i Info) Codename() (string, error) {
+	if codename, ok := supported[i.ID][i.VersionID]; ok {
+		return codename, nil
 	}
 	detected := i.PrettyName
 	if detected == "" {
 		detected = "unknown system"
 	}
-	return fmt.Errorf("unsupported system: %s (supported: Ubuntu 24.04, Ubuntu 26.04)", detected)
+	return "", fmt.Errorf("unsupported system: %s (supported: Ubuntu 24.04, Ubuntu 26.04)", detected)
 }
