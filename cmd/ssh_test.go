@@ -5,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/ABT-Tech-Limited/ft/internal/dpkgx"
+	"github.com/ABT-Tech-Limited/ft/internal/installer"
 	"github.com/ABT-Tech-Limited/ft/internal/osrelease"
+	"github.com/ABT-Tech-Limited/ft/internal/sshx"
 )
 
 type sshRecorder struct {
@@ -180,5 +183,277 @@ func TestSSHPortRejectsExtraArguments(t *testing.T) {
 	}
 	if recorder.detected != 0 || len(recorder.commands) != 0 {
 		t.Errorf("extra args caused detectOS=%d commands=%v", recorder.detected, recorder.commands)
+	}
+}
+
+func TestSSHPortChangeHappyPathWithoutPreviousConfig(t *testing.T) {
+	recorder := newSSHRecorder()
+	recorder.sshPorts = [][]int{{22}, {10222}} // before, verification
+	output, err := executeSSH(t, recorder, "port", "10222")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if recorder.detected != 1 {
+		t.Errorf("detectOS called %d times, want 1", recorder.detected)
+	}
+	if recorder.sshPortCalls != 2 {
+		t.Errorf("detectSSHPorts called %d times, want 2 (before + verify)", recorder.sshPortCalls)
+	}
+	wantQueries := [][]string{{"ufw", "fail2ban"}}
+	if !reflect.DeepEqual(recorder.queries, wantQueries) {
+		t.Errorf("queries = %v, want %v", recorder.queries, wantQueries)
+	}
+	// ufw absent + fail2ban absent → no ufw inspection, no jail sync.
+	for _, call := range recorder.outputCalls {
+		if call[0] == "ufw" {
+			t.Errorf("ufw inspected despite package absent: %v", recorder.outputCalls)
+		}
+	}
+	steps, err := sshx.PortSteps(10222)
+	if err != nil {
+		t.Fatalf("sshx.PortSteps() error = %v", err)
+	}
+	want := recordedCommands(steps)
+	want = append(want, recordedCommands([]installer.Step{sshx.SyntaxCheckStep()})...)
+	want = append(want, recordedCommands(sshx.RestartSteps(false))...)
+	if !reflect.DeepEqual(recorder.commands, want) {
+		t.Errorf("runner calls mismatch\ngot:  %#v\nwant: %#v", recorder.commands, want)
+	}
+	for _, wantText := range []string{
+		"SSH port is set to 10222.",
+		"keep this session open",
+		"ssh -p 10222",
+		"Fail2Ban is not installed; skipped SSH jail sync.",
+	} {
+		if !strings.Contains(output, wantText) {
+			t.Errorf("output %q does not contain %q", output, wantText)
+		}
+	}
+}
+
+func TestSSHPortChangeBacksUpAndCleansUpExistingConfig(t *testing.T) {
+	recorder := newSSHRecorder()
+	recorder.fileExists = true
+	recorder.sshPorts = [][]int{{22}, {10222}}
+	_, err := executeSSH(t, recorder, "port", "10222")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if want := []string{sshx.PortConfigPath}; !reflect.DeepEqual(recorder.existsCalls, want) {
+		t.Errorf("fileExists calls = %v, want %v", recorder.existsCalls, want)
+	}
+	steps, err := sshx.PortSteps(10222)
+	if err != nil {
+		t.Fatalf("sshx.PortSteps() error = %v", err)
+	}
+	want := recordedCommands([]installer.Step{sshx.BackupStep()})
+	want = append(want, recordedCommands(steps)...)
+	want = append(want, recordedCommands([]installer.Step{sshx.SyntaxCheckStep()})...)
+	want = append(want, recordedCommands([]installer.Step{sshx.RemoveBackupStep()})...)
+	want = append(want, recordedCommands(sshx.RestartSteps(false))...)
+	if !reflect.DeepEqual(recorder.commands, want) {
+		t.Errorf("runner calls mismatch\ngot:  %#v\nwant: %#v", recorder.commands, want)
+	}
+}
+
+func TestSSHPortChangeIdempotentSkipsSSHDButSyncsFail2ban(t *testing.T) {
+	recorder := newSSHRecorder()
+	recorder.statuses = map[string]dpkgx.Status{"fail2ban": dpkgx.Installed}
+	recorder.sshPorts = [][]int{{10222}}
+	output, err := executeSSH(t, recorder, "port", "10222")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if recorder.sshPortCalls != 1 {
+		t.Errorf("detectSSHPorts called %d times, want 1 (no verification pass)", recorder.sshPortCalls)
+	}
+	if !strings.Contains(output, "SSH already listens only on port 10222; skipping sshd configuration.") {
+		t.Errorf("output %q does not contain idempotence message", output)
+	}
+	if want := fail2banPortCommands("10222"); !reflect.DeepEqual(recorder.commands, want) {
+		t.Errorf("runner calls mismatch\ngot:  %#v\nwant: %#v", recorder.commands, want)
+	}
+}
+
+func TestSSHPortChangeMultiplePortsIsNotIdempotent(t *testing.T) {
+	recorder := newSSHRecorder()
+	recorder.sshPorts = [][]int{{22, 10222}, {10222}}
+	_, err := executeSSH(t, recorder, "port", "10222")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if recorder.sshPortCalls != 2 {
+		t.Errorf("detectSSHPorts called %d times, want 2 (full flow)", recorder.sshPortCalls)
+	}
+	if len(recorder.commands) == 0 {
+		t.Error("multi-port state skipped sshd configuration, want full flow")
+	}
+}
+
+func TestSSHPortChangeRefusesWhenUfwBlocksPort(t *testing.T) {
+	recorder := newSSHRecorder()
+	recorder.statuses = map[string]dpkgx.Status{"ufw": dpkgx.Installed}
+	recorder.ufwOutput = "Status: active\n\nTo   Action   From\n--   ------   ----\n22/tcp   ALLOW   Anywhere\n"
+	_, err := executeSSH(t, recorder, "port", "10222")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want ufw refusal")
+	}
+	for _, want := range []string{"ufw is active", "sudo ufw allow 10222/tcp"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Execute() error = %q, want %q", err, want)
+		}
+	}
+	if len(recorder.commands) != 0 {
+		t.Errorf("ufw refusal ran commands %v, want none", recorder.commands)
+	}
+}
+
+func TestSSHPortChangeProceedsWhenUfwAllowsPort(t *testing.T) {
+	recorder := newSSHRecorder()
+	recorder.statuses = map[string]dpkgx.Status{"ufw": dpkgx.Installed}
+	recorder.ufwOutput = "Status: active\n\nTo   Action   From\n--   ------   ----\n10222/tcp   ALLOW   Anywhere\n"
+	recorder.sshPorts = [][]int{{22}, {10222}}
+	_, err := executeSSH(t, recorder, "port", "10222")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(recorder.commands) == 0 {
+		t.Error("allowed port ran no commands, want full flow")
+	}
+}
+
+func TestSSHPortChangeRefusesWhenUfwStateUnknown(t *testing.T) {
+	recorder := newSSHRecorder()
+	recorder.statuses = map[string]dpkgx.Status{"ufw": dpkgx.Installed}
+	recorder.ufwErr = errors.New("ufw status failed")
+	_, err := executeSSH(t, recorder, "port", "10222")
+	if err == nil || !strings.Contains(err.Error(), "checking ufw state failed") {
+		t.Fatalf("Execute() error = %v, want ufw state error", err)
+	}
+	if len(recorder.commands) != 0 {
+		t.Errorf("unknown ufw state ran commands %v, want none", recorder.commands)
+	}
+}
+
+func TestSSHPortChangeInactiveUfwProceeds(t *testing.T) {
+	recorder := newSSHRecorder()
+	recorder.statuses = map[string]dpkgx.Status{"ufw": dpkgx.Installed}
+	recorder.ufwOutput = "Status: inactive\n"
+	recorder.sshPorts = [][]int{{22}, {10222}}
+	if _, err := executeSSH(t, recorder, "port", "10222"); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+}
+
+func TestSSHPortChangeRollsBackWhenSyntaxCheckFails(t *testing.T) {
+	tests := []struct {
+		name      string
+		hadConfig bool
+		finalStep installer.Step
+	}{
+		{name: "no previous config removes file", finalStep: sshx.RemoveConfigStep()},
+		{name: "previous config restored", hadConfig: true, finalStep: sshx.RestoreStep()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wantErr := errors.New("sshd -t failed")
+			recorder := newSSHRecorder()
+			recorder.fileExists = tt.hadConfig
+			recorder.sshPorts = [][]int{{22}}
+			syntaxIndex := 3 // PortSteps(3) then SyntaxCheckStep
+			if tt.hadConfig {
+				syntaxIndex = 4 // BackupStep first
+			}
+			recorder.runErrorAt = syntaxIndex
+			recorder.runErr = wantErr
+			_, err := executeSSH(t, recorder, "port", "10222")
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("Execute() error = %v, want errors.Is(_, wantErr)", err)
+			}
+			last := recorder.commands[len(recorder.commands)-1]
+			if !reflect.DeepEqual(last.argv, tt.finalStep.Argv) {
+				t.Errorf("last command = %v, want rollback %v", last.argv, tt.finalStep.Argv)
+			}
+			for _, command := range recorder.commands {
+				if command.argv[0] == "systemctl" {
+					t.Errorf("validation failure restarted services: %v", recorder.commands)
+				}
+			}
+		})
+	}
+}
+
+func TestSSHPortChangeRollsBackWhenEffectivePortMismatch(t *testing.T) {
+	recorder := newSSHRecorder()
+	recorder.sshPorts = [][]int{{22}, {22}} // verification still reports 22
+	_, err := executeSSH(t, recorder, "port", "10222")
+	if err == nil || !strings.Contains(err.Error(), "still reports port(s) 22") {
+		t.Fatalf("Execute() error = %v, want mismatch error", err)
+	}
+	last := recorder.commands[len(recorder.commands)-1]
+	if !reflect.DeepEqual(last.argv, sshx.RemoveConfigStep().Argv) {
+		t.Errorf("last command = %v, want config removal", last.argv)
+	}
+	for _, command := range recorder.commands {
+		if command.argv[0] == "systemctl" {
+			t.Errorf("mismatch restarted services: %v", recorder.commands)
+		}
+	}
+}
+
+func TestSSHPortChangeSocketActivatedRestart(t *testing.T) {
+	recorder := newSSHRecorder()
+	recorder.socketErr = nil // is-enabled ssh.socket succeeds → socket mode
+	recorder.sshPorts = [][]int{{22}, {10222}}
+	_, err := executeSSH(t, recorder, "port", "10222")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	var systemctl [][]string
+	for _, command := range recorder.commands {
+		if command.argv[0] == "systemctl" {
+			systemctl = append(systemctl, command.argv)
+		}
+	}
+	want := [][]string{
+		{"systemctl", "daemon-reload"},
+		{"systemctl", "restart", "ssh.socket"},
+		{"systemctl", "restart", "ssh.service"},
+	}
+	if !reflect.DeepEqual(systemctl, want) {
+		t.Errorf("systemctl calls = %v, want %v", systemctl, want)
+	}
+}
+
+func TestSSHPortChangeSyncsInstalledFail2ban(t *testing.T) {
+	recorder := newSSHRecorder()
+	recorder.statuses = map[string]dpkgx.Status{"fail2ban": dpkgx.Installed}
+	recorder.sshPorts = [][]int{{22}, {10222}}
+	output, err := executeSSH(t, recorder, "port", "10222")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(output, "Syncing Fail2Ban SSH jail") {
+		t.Errorf("output %q does not mention fail2ban sync", output)
+	}
+	jail := fail2banPortCommands("10222")
+	tail := recorder.commands[len(recorder.commands)-len(jail):]
+	if !reflect.DeepEqual(tail, jail) {
+		t.Errorf("fail2ban sync commands mismatch\ngot:  %#v\nwant: %#v", tail, jail)
+	}
+}
+
+func TestSSHPortChangeInvalidArgumentRejectedEarly(t *testing.T) {
+	for _, value := range []string{"abc", "0", "-5", "65536"} {
+		t.Run(value, func(t *testing.T) {
+			recorder := newSSHRecorder()
+			_, err := executeSSH(t, recorder, "port", value)
+			if err == nil {
+				t.Fatal("Execute() error = nil, want parse error")
+			}
+			if recorder.detected != 0 || len(recorder.commands) != 0 {
+				t.Errorf("invalid port caused detectOS=%d commands=%v", recorder.detected, recorder.commands)
+			}
+		})
 	}
 }

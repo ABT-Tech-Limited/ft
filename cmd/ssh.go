@@ -9,9 +9,11 @@ import (
 	"strings"
 
 	"github.com/ABT-Tech-Limited/ft/internal/dpkgx"
+	"github.com/ABT-Tech-Limited/ft/internal/installer"
 	"github.com/ABT-Tech-Limited/ft/internal/osrelease"
 	"github.com/ABT-Tech-Limited/ft/internal/sshx"
 	"github.com/ABT-Tech-Limited/ft/internal/sysx"
+	"github.com/ABT-Tech-Limited/ft/internal/ufwx"
 	"github.com/spf13/cobra"
 )
 
@@ -91,7 +93,56 @@ func runSSHPortShow(cmd *cobra.Command, deps sshDependencies) error {
 }
 
 func runSSHPortChange(cmd *cobra.Command, deps sshDependencies, port int) error {
-	return fmt.Errorf("changing the SSH port is not implemented yet")
+	if _, err := deps.detectOS(); err != nil {
+		return err
+	}
+	ctx := cmd.Context()
+	out := cmd.OutOrStdout()
+
+	currentPorts, err := deps.detectSSHPorts(ctx)
+	if err != nil {
+		return fmt.Errorf("detecting effective SSH ports failed: %w", err)
+	}
+	alreadyActive := len(currentPorts) == 1 && currentPorts[0] == port
+
+	fmt.Fprintln(out, "\n==> Checking firewall and package status")
+	statuses, err := deps.queryPackages(ctx, "ufw", "fail2ban")
+	if err != nil {
+		return fmt.Errorf("checking package status failed: %w", err)
+	}
+
+	if alreadyActive {
+		fmt.Fprintf(out, "SSH already listens only on port %d; skipping sshd configuration.\n", port)
+	} else {
+		if statuses["ufw"] != dpkgx.Absent {
+			report, err := ufwx.Inspect(ctx, deps.output, port)
+			if err != nil {
+				return fmt.Errorf(
+					"checking ufw state failed: %w; refusing to change the SSH port while the firewall state is unknown",
+					err,
+				)
+			}
+			if report.Active && !report.PortAllowed {
+				return fmt.Errorf(
+					"ufw is active but TCP port %d is not allowed; run \"sudo ufw allow %d/tcp\" first, then retry",
+					port, port,
+				)
+			}
+		}
+		if err := applySSHPortChange(cmd, deps, port); err != nil {
+			return err
+		}
+	}
+
+	if err := syncFail2banSSHPort(cmd, deps, statuses["fail2ban"], port); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(out, "\nSSH port is set to %d.\n", port)
+	fmt.Fprintln(out, "IMPORTANT: keep this session open. From a new terminal, verify that")
+	fmt.Fprintf(out, "\"ssh -p %d user@host\" works before you disconnect.\n", port)
+	fmt.Fprintln(out, "If an old ufw rule still allows the previous port, remove it after verifying.")
+	return nil
 }
 
 func joinPorts(ports []int) string {
@@ -100,6 +151,118 @@ func joinPorts(ports []int) string {
 		values[i] = strconv.Itoa(port)
 	}
 	return strings.Join(values, ", ")
+}
+
+// applySSHPortChange installs the drop-in, validates it, and restarts SSH.
+// Validation failures roll the file back and never restart: the running
+// sshd keeps serving its old configuration, so the system stays reachable.
+func applySSHPortChange(cmd *cobra.Command, deps sshDependencies, port int) error {
+	hadPrevious, err := deps.fileExists(sshx.PortConfigPath)
+	if err != nil {
+		return fmt.Errorf("checking existing SSH port configuration failed: %w", err)
+	}
+	steps, err := sshx.PortSteps(port)
+	if err != nil {
+		return err
+	}
+	if hadPrevious {
+		steps = append([]installer.Step{sshx.BackupStep()}, steps...)
+	}
+	if err := runSSHSteps(cmd, deps, steps); err != nil {
+		return err
+	}
+
+	if err := verifySSHConfiguration(cmd, deps, port); err != nil {
+		rollbackSSHPortChange(cmd, deps, hadPrevious)
+		return err
+	}
+	if hadPrevious {
+		if err := runSSHSteps(cmd, deps, []installer.Step{sshx.RemoveBackupStep()}); err != nil {
+			return err
+		}
+	}
+	return restartSSH(cmd, deps)
+}
+
+func verifySSHConfiguration(cmd *cobra.Command, deps sshDependencies, port int) error {
+	if err := runSSHSteps(cmd, deps, []installer.Step{sshx.SyntaxCheckStep()}); err != nil {
+		return err
+	}
+	fmt.Fprintln(cmd.OutOrStdout(), "\n==> Verifying effective SSH configuration")
+	ports, err := deps.detectSSHPorts(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("re-reading effective SSH ports failed: %w", err)
+	}
+	if len(ports) != 1 || ports[0] != port {
+		return fmt.Errorf(
+			"sshd still reports port(s) %s instead of %d; another configuration file takes precedence over %s",
+			joinPorts(ports), port, sshx.PortConfigPath,
+		)
+	}
+	return nil
+}
+
+// rollbackSSHPortChange restores the pre-change drop-in state. Failures are
+// reported on stdout rather than returned: the caller's validation error is
+// the actionable one, and the running sshd is untouched either way.
+func rollbackSSHPortChange(cmd *cobra.Command, deps sshDependencies, hadPrevious bool) {
+	step := sshx.RemoveConfigStep()
+	if hadPrevious {
+		step = sshx.RestoreStep()
+	}
+	if err := runSSHSteps(cmd, deps, []installer.Step{step}); err != nil {
+		fmt.Fprintf(
+			cmd.OutOrStdout(),
+			"Rollback failed: %v\nManually inspect %s before restarting SSH.\n",
+			err, sshx.PortConfigPath,
+		)
+	}
+}
+
+func restartSSH(cmd *cobra.Command, deps sshDependencies) error {
+	_, socketErr := deps.output(cmd.Context(), []string{"systemctl", "is-enabled", "ssh.socket"})
+	for _, step := range sshx.RestartSteps(socketErr == nil) {
+		if err := runSSHSteps(cmd, deps, []installer.Step{step}); err != nil {
+			return fmt.Errorf(
+				"%w\nSSH may be down, but your current session stays alive. Inspect \"journalctl -u ssh\"; to roll back, remove %s and restart ssh",
+				err, sshx.PortConfigPath,
+			)
+		}
+	}
+	return nil
+}
+
+func syncFail2banSSHPort(cmd *cobra.Command, deps sshDependencies, status dpkgx.Status, port int) error {
+	out := cmd.OutOrStdout()
+	switch status {
+	case dpkgx.Installed:
+	case dpkgx.Broken:
+		fmt.Fprintln(out, "Warning: fail2ban is in a broken package state; skipped SSH jail sync. Repair it, then re-run \"ft install fail2ban\".")
+		return nil
+	default:
+		fmt.Fprintln(out, "Fail2Ban is not installed; skipped SSH jail sync.")
+		return nil
+	}
+	plan, err := installer.Fail2banWithSSHPort(port)
+	if err != nil {
+		return fmt.Errorf("building Fail2Ban SSH port configuration failed: %w", err)
+	}
+	fmt.Fprintln(out, "\n==> Syncing Fail2Ban SSH jail")
+	return runSSHSteps(cmd, deps, plan.EnsureSteps)
+}
+
+func runSSHSteps(cmd *cobra.Command, deps sshDependencies, steps []installer.Step) error {
+	for _, step := range steps {
+		fmt.Fprintf(cmd.OutOrStdout(), "\n==> %s\n", step.Title)
+		var input io.Reader
+		if step.Input != "" {
+			input = strings.NewReader(step.Input)
+		}
+		if err := deps.run(cmd.Context(), step.Argv, input); err != nil {
+			return fmt.Errorf("%s failed: %w", lowerFirst(step.Title), err)
+		}
+	}
+	return nil
 }
 
 func init() {
