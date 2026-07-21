@@ -10,6 +10,7 @@ import (
 	"github.com/ABT-Tech-Limited/ft/internal/dpkgx"
 	"github.com/ABT-Tech-Limited/ft/internal/installer"
 	"github.com/ABT-Tech-Limited/ft/internal/osrelease"
+	"github.com/ABT-Tech-Limited/ft/internal/sshx"
 	"github.com/ABT-Tech-Limited/ft/internal/sysx"
 	"github.com/ABT-Tech-Limited/ft/internal/userx"
 	"github.com/spf13/cobra"
@@ -18,6 +19,7 @@ import (
 type installDependencies struct {
 	detectOS        func() (osrelease.Info, error)
 	goarch          string
+	detectSSHPorts  func(context.Context) ([]int, error)
 	dockerGroupUser func() (string, bool, error)
 	queryPackages   func(context.Context, ...string) (map[string]dpkgx.Status, error)
 	run             func(context.Context, []string, io.Reader) error
@@ -30,9 +32,59 @@ func newInstallCmd(deps installDependencies) *cobra.Command {
 		Long: `Install server software using supported, auditable package sources.
 
 Currently available: Docker Engine from Docker's official apt repository,
-and Nginx from Ubuntu's apt repository.`,
+plus Nginx and Fail2Ban from Ubuntu's apt repositories.`,
 		Args: cobra.NoArgs,
 	}
+	var fail2banSSHPort int
+	fail2banCmd := &cobra.Command{
+		Use:   "fail2ban",
+		Short: "Install Fail2Ban SSH brute-force protection",
+		Long: `Install Fail2Ban and nftables from Ubuntu's apt repositories.
+
+Ubuntu's default SSH jail uses the systemd journal and nftables. By default,
+before package setup, ft runs /usr/sbin/sshd -T to read every effective SSH port.
+It then writes its managed override, validates it, and restarts Fail2Ban.
+
+Use --ssh-port only to override automatic detection. ft does not change sshd,
+firewall settings, or other Fail2Ban configuration files.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			plan := installer.Fail2ban()
+			if cmd.Flags().Changed("ssh-port") {
+				customPlan, err := installer.Fail2banWithSSHPort(fail2banSSHPort)
+				if err != nil {
+					return err
+				}
+				plan = customPlan
+			}
+			if _, err := deps.detectOS(); err != nil {
+				return err
+			}
+			if !cmd.Flags().Changed("ssh-port") {
+				sshPorts, err := deps.detectSSHPorts(cmd.Context())
+				if err != nil {
+					return fmt.Errorf("detecting effective SSH ports failed: %w; use --ssh-port to override", err)
+				}
+				customPlan, err := installer.Fail2banWithSSHPorts(sshPorts)
+				if err != nil {
+					return fmt.Errorf("building Fail2Ban SSH port configuration failed: %w", err)
+				}
+				plan = customPlan
+				portValues := make([]string, len(sshPorts))
+				for i, sshPort := range sshPorts {
+					portValues[i] = fmt.Sprintf("%d", sshPort)
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Detected effective SSH port(s): %s\n", strings.Join(portValues, ", "))
+			}
+			return runInstallPlan(cmd, "Fail2Ban", plan, deps)
+		},
+	}
+	fail2banCmd.Flags().IntVar(
+		&fail2banSSHPort,
+		"ssh-port",
+		0,
+		"override the automatically detected SSH TCP port (does not change sshd)",
+	)
 
 	installCmd.AddCommand(
 		&cobra.Command{
@@ -90,6 +142,7 @@ Docker group membership.`,
 				return runInstallPlan(cmd, "Nginx", installer.Nginx(), deps)
 			},
 		},
+		fail2banCmd,
 	)
 
 	return installCmd
@@ -168,8 +221,11 @@ func lowerFirst(value string) string {
 
 func init() {
 	rootCmd.AddCommand(newInstallCmd(installDependencies{
-		detectOS:        detectOS,
-		goarch:          runtime.GOARCH,
+		detectOS: detectOS,
+		goarch:   runtime.GOARCH,
+		detectSSHPorts: func(ctx context.Context) ([]int, error) {
+			return sshx.EffectivePorts(ctx, sysx.OutputContext)
+		},
 		dockerGroupUser: userx.Invoking,
 		queryPackages:   dpkgx.Query,
 		run:             sysx.RunInputContext,

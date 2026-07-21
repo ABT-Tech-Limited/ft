@@ -1,6 +1,8 @@
 package installer
 
 import (
+	"fmt"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -97,7 +99,7 @@ func TestDocker(t *testing.T) {
 					},
 				},
 			}
-			wantService := []Step{
+			wantEnsure := []Step{
 				{Title: "Enabling and starting Docker", Argv: []string{"systemctl", "enable", "--now", "docker.service"}},
 			}
 			want := Plan{
@@ -117,14 +119,14 @@ func TestDocker(t *testing.T) {
 					"containerd",
 					"runc",
 				},
-				SetupSteps:   wantSetup,
-				ServiceSteps: wantService,
+				SetupSteps:  wantSetup,
+				EnsureSteps: wantEnsure,
 			}
 
 			if !reflect.DeepEqual(got, want) {
 				t.Errorf("Docker() plan mismatch\ngot:  %#v\nwant: %#v", got, want)
 			}
-			assertPlanSteps(t, got, wantSetup, wantService)
+			assertPlanSteps(t, got, wantSetup, wantEnsure)
 		})
 	}
 }
@@ -171,19 +173,132 @@ func TestNginx(t *testing.T) {
 			},
 		},
 	}
-	wantService := []Step{
+	wantEnsure := []Step{
 		{Title: "Enabling and starting Nginx", Argv: []string{"systemctl", "enable", "--now", "nginx.service"}},
 	}
 	want := Plan{
 		RequiredPackages: []string{"nginx"},
 		SetupSteps:       wantSetup,
-		ServiceSteps:     wantService,
+		EnsureSteps:      wantEnsure,
 	}
 
 	if got := Nginx(); !reflect.DeepEqual(got, want) {
 		t.Errorf("Nginx() plan mismatch\ngot:  %#v\nwant: %#v", got, want)
 	} else {
-		assertPlanSteps(t, got, wantSetup, wantService)
+		assertPlanSteps(t, got, wantSetup, wantEnsure)
+	}
+}
+
+func TestFail2ban(t *testing.T) {
+	wantSetup := []Step{
+		{Title: "Updating package index", Argv: []string{"apt-get", "update"}},
+		{
+			Title: "Installing Fail2Ban and nftables",
+			Argv: []string{
+				"apt-get", "install", "-y",
+				"-o", "Dpkg::Options::=--force-confdef",
+				"-o", "Dpkg::Options::=--force-confold",
+				"fail2ban", "nftables",
+			},
+		},
+	}
+	wantEnsure := []Step{
+		{
+			Title: "Validating Fail2Ban configuration",
+			Argv:  []string{"/usr/bin/fail2ban-client", "-t"},
+		},
+		{
+			Title: "Enabling and starting Fail2Ban",
+			Argv:  []string{"systemctl", "enable", "--now", "fail2ban.service"},
+		},
+	}
+	want := Plan{
+		RequiredPackages: []string{"fail2ban", "nftables"},
+		SetupSteps:       wantSetup,
+		EnsureSteps:      wantEnsure,
+	}
+
+	if got := Fail2ban(); !reflect.DeepEqual(got, want) {
+		t.Errorf("Fail2ban() plan mismatch\ngot:  %#v\nwant: %#v", got, want)
+	} else {
+		assertPlanSteps(t, got, wantSetup, wantEnsure)
+	}
+}
+
+func TestFail2banWithSSHPorts(t *testing.T) {
+	base := Fail2ban()
+	tempPath := fmt.Sprintf("/etc/fail2ban/jail.d/zz-ft-sshd.conf.%d.tmp", os.Getpid())
+	got, err := Fail2banWithSSHPorts([]int{22, 10222, 22})
+	if err != nil {
+		t.Fatalf("Fail2banWithSSHPorts() error = %v", err)
+	}
+	wantEnsure := []Step{
+		{
+			Title: "Creating Fail2Ban configuration directory",
+			Argv:  []string{"install", "-m", "0755", "-d", "/etc/fail2ban/jail.d"},
+		},
+		{
+			Title: "Writing Fail2Ban SSH port configuration",
+			Argv: []string{
+				"install", "-o", "root", "-g", "root", "-m", "0644",
+				"/dev/stdin", tempPath,
+			},
+			Input: "# Managed by ft. Re-run ft install fail2ban to update.\n\n[sshd]\nenabled = true\nport = 22,10222\n",
+		},
+		{
+			Title: "Activating Fail2Ban SSH port configuration",
+			Argv: []string{
+				"mv", "-f",
+				tempPath,
+				"/etc/fail2ban/jail.d/zz-ft-sshd.conf",
+			},
+		},
+		{
+			Title: "Validating Fail2Ban configuration",
+			Argv:  []string{"/usr/bin/fail2ban-client", "-t"},
+		},
+		{
+			Title: "Enabling Fail2Ban at boot",
+			Argv:  []string{"systemctl", "enable", "fail2ban.service"},
+		},
+		{
+			Title: "Restarting Fail2Ban with SSH port configuration",
+			Argv:  []string{"systemctl", "restart", "fail2ban.service"},
+		},
+	}
+	want := Plan{
+		RequiredPackages: base.RequiredPackages,
+		SetupSteps:       base.SetupSteps,
+		EnsureSteps:      wantEnsure,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Fail2banWithSSHPorts() plan mismatch\ngot:  %#v\nwant: %#v", got, want)
+	}
+	assertPlanSteps(t, got, base.SetupSteps, wantEnsure)
+}
+
+func TestFail2banWithSSHPortsRejectsInvalidPorts(t *testing.T) {
+	tests := []struct {
+		name  string
+		ports []int
+		want  string
+	}{
+		{name: "empty", want: "at least one SSH port"},
+		{name: "negative", ports: []int{-1}, want: "between 1 and 65535"},
+		{name: "zero", ports: []int{0}, want: "between 1 and 65535"},
+		{name: "too large", ports: []int{65536}, want: "between 1 and 65535"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan, err := Fail2banWithSSHPorts(tt.ports)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Fail2banWithSSHPorts() plan=%#v error=%v, want error containing %q", plan, err, tt.want)
+			}
+			if !reflect.DeepEqual(plan, Plan{}) {
+				t.Errorf("Fail2banWithSSHPorts() plan = %#v, want zero value", plan)
+			}
+		})
 	}
 }
 
@@ -236,13 +351,13 @@ func TestDockerGroupStepRejectsEmptyUsername(t *testing.T) {
 	}
 }
 
-func assertPlanSteps(t *testing.T, plan Plan, wantSetup, wantService []Step) {
+func assertPlanSteps(t *testing.T, plan Plan, wantSetup, wantEnsure []Step) {
 	t.Helper()
-	wantFull := append(append([]Step(nil), wantSetup...), wantService...)
+	wantFull := append(append([]Step(nil), wantSetup...), wantEnsure...)
 	if got := plan.Steps(false); !reflect.DeepEqual(got, wantFull) {
 		t.Errorf("Steps(false) = %#v, want %#v", got, wantFull)
 	}
-	if got := plan.Steps(true); !reflect.DeepEqual(got, wantService) {
-		t.Errorf("Steps(true) = %#v, want %#v", got, wantService)
+	if got := plan.Steps(true); !reflect.DeepEqual(got, wantEnsure) {
+		t.Errorf("Steps(true) = %#v, want %#v", got, wantEnsure)
 	}
 }

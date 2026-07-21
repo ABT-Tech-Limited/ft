@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -27,12 +29,16 @@ type installRecorder struct {
 	dockerGroupUsername  string
 	dockerGroupShouldAdd bool
 	dockerGroupErr       error
+	sshPorts             []int
+	sshPortErr           error
 	detected             int
 	dockerGroupCalls     int
+	sshPortCalls         int
 	queries              [][]string
 	commands             []recordedInstallCommand
 	queryContexts        []context.Context
 	runContexts          []context.Context
+	sshPortContexts      []context.Context
 	runErrorAt           int
 	runErr               error
 }
@@ -41,6 +47,7 @@ func newInstallRecorder(statuses map[string]dpkgx.Status) *installRecorder {
 	return &installRecorder{
 		statuses:   statuses,
 		goarch:     "amd64",
+		sshPorts:   []int{22},
 		runErrorAt: -1,
 	}
 }
@@ -55,6 +62,11 @@ func (r *installRecorder) dependencies() installDependencies {
 			return osrelease.Info{ID: "ubuntu", VersionID: "24.04"}, nil
 		},
 		goarch: r.goarch,
+		detectSSHPorts: func(ctx context.Context) ([]int, error) {
+			r.sshPortCalls++
+			r.sshPortContexts = append(r.sshPortContexts, ctx)
+			return append([]int(nil), r.sshPorts...), r.sshPortErr
+		},
 		dockerGroupUser: func() (string, bool, error) {
 			r.dockerGroupCalls++
 			return r.dockerGroupUsername, r.dockerGroupShouldAdd, r.dockerGroupErr
@@ -103,6 +115,7 @@ func TestInstallAbsentPackagesRunExpectedSteps(t *testing.T) {
 	}{
 		{name: "Docker", command: "docker", product: "Docker", plan: mustDockerPlan(t)},
 		{name: "Nginx", command: "nginx", product: "Nginx", plan: installer.Nginx()},
+		{name: "Fail2Ban", command: "fail2ban", product: "Fail2Ban", plan: mustFail2banPlan(t, 22)},
 	}
 
 	for _, tt := range tests {
@@ -151,6 +164,7 @@ func TestInstallAlreadyInstalledSkipsPackageSetup(t *testing.T) {
 	}{
 		{name: "Docker", command: "docker", product: "Docker", plan: mustDockerPlan(t)},
 		{name: "Nginx", command: "nginx", product: "Nginx", plan: installer.Nginx()},
+		{name: "Fail2Ban", command: "fail2ban", product: "Fail2Ban", plan: mustFail2banPlan(t, 22)},
 	}
 
 	for _, tt := range tests {
@@ -276,6 +290,143 @@ func TestInstallDockerPartialInstallationRunsFullPlan(t *testing.T) {
 	}
 }
 
+func TestInstallFail2banWithoutNftablesRunsFullPlan(t *testing.T) {
+	plan := mustFail2banPlan(t, 22)
+	recorder := newInstallRecorder(map[string]dpkgx.Status{"fail2ban": dpkgx.Installed})
+
+	if _, err := executeInstall(t, recorder, "fail2ban"); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	want := recordedCommands(plan.Steps(false))
+	if !reflect.DeepEqual(recorder.commands, want) {
+		t.Errorf("runner calls mismatch\ngot:  %#v\nwant: %#v", recorder.commands, want)
+	}
+}
+
+func TestInstallFail2banConfiguresCustomSSHPort(t *testing.T) {
+	plan := installer.Fail2ban()
+	recorder := newInstallRecorder(installedStatuses(plan.RequiredPackages))
+
+	output, err := executeInstall(t, recorder, "fail2ban", "--ssh-port", "10222")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	want := fail2banPortCommands("10222")
+	if !reflect.DeepEqual(recorder.commands, want) {
+		t.Errorf("runner calls mismatch\ngot:  %#v\nwant: %#v", recorder.commands, want)
+	}
+	if recorder.sshPortCalls != 0 {
+		t.Errorf("explicit SSH port caused %d automatic detections, want 0", recorder.sshPortCalls)
+	}
+	if !strings.Contains(output, "Fail2Ban is ready.") {
+		t.Errorf("output %q does not contain readiness message", output)
+	}
+}
+
+func TestInstallFail2banAutomaticallyConfiguresEffectiveSSHPorts(t *testing.T) {
+	tests := []struct {
+		name       string
+		ports      []int
+		wantConfig string
+		wantOutput string
+	}{
+		{name: "custom port", ports: []int{10222}, wantConfig: "10222", wantOutput: "10222"},
+		{name: "migration ports", ports: []int{22, 10222}, wantConfig: "22,10222", wantOutput: "22, 10222"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := installer.Fail2ban()
+			recorder := newInstallRecorder(installedStatuses(plan.RequiredPackages))
+			recorder.sshPorts = tt.ports
+
+			output, err := executeInstall(t, recorder, "fail2ban")
+			if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			if want := fail2banPortCommands(tt.wantConfig); !reflect.DeepEqual(recorder.commands, want) {
+				t.Errorf("runner calls mismatch\ngot:  %#v\nwant: %#v", recorder.commands, want)
+			}
+			if recorder.sshPortCalls != 1 {
+				t.Errorf("automatic SSH port detections = %d, want 1", recorder.sshPortCalls)
+			}
+			if want := "Detected effective SSH port(s): " + tt.wantOutput; !strings.Contains(output, want) {
+				t.Errorf("output %q does not contain %q", output, want)
+			}
+		})
+	}
+}
+
+func TestInstallFail2banStopsWhenSSHPortDetectionFails(t *testing.T) {
+	wantErr := errors.New("sshd effective config failed")
+	recorder := newInstallRecorder(nil)
+	recorder.sshPortErr = wantErr
+
+	output, err := executeInstall(t, recorder, "fail2ban")
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Execute() error = %v, want errors.Is(_, wantErr)", err)
+	}
+	for _, want := range []string{"detecting effective SSH ports failed", "--ssh-port"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Execute() error = %q, want %q", err, want)
+		}
+	}
+	if recorder.detected != 1 || recorder.sshPortCalls != 1 || len(recorder.queries) != 0 || len(recorder.commands) != 0 {
+		t.Errorf(
+			"detection failure caused detectOS=%d, detectSSH=%d, queries=%v, commands=%v",
+			recorder.detected,
+			recorder.sshPortCalls,
+			recorder.queries,
+			recorder.commands,
+		)
+	}
+	if strings.Contains(output, "is ready") || strings.Contains(output, "installed successfully") {
+		t.Errorf("detection failure output contains success message: %q", output)
+	}
+}
+
+func TestInstallFail2banRejectsInvalidSSHPortBeforeInspection(t *testing.T) {
+	for _, port := range []string{"-1", "0", "65536"} {
+		t.Run(port, func(t *testing.T) {
+			recorder := newInstallRecorder(nil)
+			output, err := executeInstall(t, recorder, "fail2ban", "--ssh-port", port)
+			if err == nil || !strings.Contains(err.Error(), "SSH port must be between 1 and 65535") {
+				t.Fatalf("Execute() error = %v, want SSH port range error", err)
+			}
+			if recorder.detected != 0 || recorder.sshPortCalls != 0 || len(recorder.queries) != 0 || len(recorder.commands) != 0 {
+				t.Errorf(
+					"invalid port caused detectOS=%d, detectSSH=%d, queries=%v, commands=%v",
+					recorder.detected,
+					recorder.sshPortCalls,
+					recorder.queries,
+					recorder.commands,
+				)
+			}
+			if strings.Contains(output, "is ready") || strings.Contains(output, "installed successfully") {
+				t.Errorf("invalid port output contains success message: %q", output)
+			}
+		})
+	}
+}
+
+func fail2banPortCommands(portList string) []recordedInstallCommand {
+	tempPath := fmt.Sprintf("/etc/fail2ban/jail.d/zz-ft-sshd.conf.%d.tmp", os.Getpid())
+	return []recordedInstallCommand{
+		{argv: []string{"install", "-m", "0755", "-d", "/etc/fail2ban/jail.d"}},
+		{
+			argv: []string{
+				"install", "-o", "root", "-g", "root", "-m", "0644",
+				"/dev/stdin", tempPath,
+			},
+			input: "# Managed by ft. Re-run ft install fail2ban to update.\n\n[sshd]\nenabled = true\nport = " + portList + "\n",
+		},
+		{argv: []string{"mv", "-f", tempPath, "/etc/fail2ban/jail.d/zz-ft-sshd.conf"}},
+		{argv: []string{"/usr/bin/fail2ban-client", "-t"}},
+		{argv: []string{"systemctl", "enable", "fail2ban.service"}},
+		{argv: []string{"systemctl", "restart", "fail2ban.service"}},
+	}
+}
+
 func TestInstallDockerRejectsConflictsBeforeMutation(t *testing.T) {
 	plan := mustDockerPlan(t)
 	tests := make([]struct {
@@ -355,6 +506,7 @@ func TestInstallStopsWhenPackageQueryFails(t *testing.T) {
 	}{
 		{command: "docker", product: "Docker"},
 		{command: "nginx", product: "Nginx"},
+		{command: "fail2ban", product: "Fail2Ban"},
 	}
 
 	for _, tt := range tests {
@@ -385,8 +537,8 @@ func TestInstallStopsWhenPackageQueryFails(t *testing.T) {
 	}
 }
 
-func TestAlreadyInstalledServiceFailure(t *testing.T) {
-	wantErr := errors.New("systemctl failed")
+func TestAlreadyInstalledEnsureFailure(t *testing.T) {
+	wantErr := errors.New("ensure step failed")
 	tests := []struct {
 		command string
 		product string
@@ -394,6 +546,7 @@ func TestAlreadyInstalledServiceFailure(t *testing.T) {
 	}{
 		{command: "docker", product: "Docker", plan: mustDockerPlan(t)},
 		{command: "nginx", product: "Nginx", plan: installer.Nginx()},
+		{command: "fail2ban", product: "Fail2Ban", plan: mustFail2banPlan(t, 22)},
 	}
 
 	for _, tt := range tests {
@@ -412,19 +565,45 @@ func TestAlreadyInstalledServiceFailure(t *testing.T) {
 			if len(recorder.commands) != 1 {
 				t.Errorf("runner called %d times, want 1", len(recorder.commands))
 			}
-			if !strings.Contains(err.Error(), lowerFirst(tt.plan.ServiceSteps[0].Title)) {
-				t.Errorf("Execute() error = %q, want service step context", err)
+			if !strings.Contains(err.Error(), lowerFirst(tt.plan.EnsureSteps[0].Title)) {
+				t.Errorf("Execute() error = %q, want ensure step context", err)
 			}
 			if strings.Contains(output, "is ready") {
-				t.Errorf("service failure output contains ready message: %q", output)
+				t.Errorf("ensure failure output contains ready message: %q", output)
 			}
 			if tt.command == "docker" {
 				if recorder.dockerGroupCalls != 1 {
 					t.Errorf("Docker group resolver called %d times, want 1", recorder.dockerGroupCalls)
 				}
 				if strings.Contains(output, "root-equivalent") || strings.Contains(output, "Sign out and sign back in") {
-					t.Errorf("service failure output contains group access guidance: %q", output)
+					t.Errorf("ensure failure output contains group access guidance: %q", output)
 				}
+			}
+		})
+	}
+}
+
+func TestInstallFail2banStopsAtFailedEnsureStep(t *testing.T) {
+	plan := mustFail2banPlan(t, 22)
+	for failAt, failedStep := range plan.EnsureSteps {
+		t.Run(failedStep.Title, func(t *testing.T) {
+			wantErr := errors.New("Fail2Ban ensure step failed")
+			recorder := newInstallRecorder(installedStatuses(plan.RequiredPackages))
+			recorder.runErrorAt = failAt
+			recorder.runErr = wantErr
+
+			output, err := executeInstall(t, recorder, "fail2ban")
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("Execute() error = %v, want errors.Is(_, wantErr)", err)
+			}
+			if len(recorder.commands) != failAt+1 {
+				t.Errorf("runner called %d times, want %d", len(recorder.commands), failAt+1)
+			}
+			if !strings.Contains(err.Error(), lowerFirst(failedStep.Title)) {
+				t.Errorf("Execute() error = %q, want step context", err)
+			}
+			if strings.Contains(output, "Fail2Ban is ready.") {
+				t.Errorf("failed ensure step output contains ready message: %q", output)
 			}
 		})
 	}
@@ -511,20 +690,32 @@ func TestInstallDockerFailureBeforeGroupStepStopsAuthorization(t *testing.T) {
 	}
 }
 
-func TestInstallNginxNeverResolvesDockerGroupUser(t *testing.T) {
-	plan := installer.Nginx()
-	recorder := newInstallRecorder(installedStatuses(plan.RequiredPackages))
-	recorder.dockerGroupErr = errors.New("Docker group resolver must not be called")
+func TestInstallNonDockerCommandsNeverResolveDockerGroupUser(t *testing.T) {
+	tests := []struct {
+		command string
+		product string
+		plan    installer.Plan
+	}{
+		{command: "nginx", product: "Nginx", plan: installer.Nginx()},
+		{command: "fail2ban", product: "Fail2Ban", plan: installer.Fail2ban()},
+	}
 
-	output, err := executeInstall(t, recorder, "nginx")
-	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-	if recorder.dockerGroupCalls != 0 {
-		t.Errorf("Docker group resolver called %d times, want 0", recorder.dockerGroupCalls)
-	}
-	if !strings.Contains(output, "Nginx is ready.") {
-		t.Errorf("output %q does not contain Nginx readiness message", output)
+	for _, tt := range tests {
+		t.Run(tt.product, func(t *testing.T) {
+			recorder := newInstallRecorder(installedStatuses(tt.plan.RequiredPackages))
+			recorder.dockerGroupErr = errors.New("Docker group resolver must not be called")
+
+			output, err := executeInstall(t, recorder, tt.command)
+			if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			if recorder.dockerGroupCalls != 0 {
+				t.Errorf("Docker group resolver called %d times, want 0", recorder.dockerGroupCalls)
+			}
+			if want := tt.product + " is ready."; !strings.Contains(output, want) {
+				t.Errorf("output %q does not contain %q", output, want)
+			}
+		})
 	}
 }
 
@@ -544,10 +735,42 @@ func TestInstallDockerHelpDisclosesGroupPrivilege(t *testing.T) {
 			t.Errorf("help output %q does not contain %q", output, want)
 		}
 	}
-	if recorder.detected != 0 || recorder.dockerGroupCalls != 0 || len(recorder.queries) != 0 || len(recorder.commands) != 0 {
+	if recorder.detected != 0 || recorder.sshPortCalls != 0 || recorder.dockerGroupCalls != 0 || len(recorder.queries) != 0 || len(recorder.commands) != 0 {
 		t.Errorf(
-			"help caused detect=%d, resolver=%d, queries=%v, commands=%v",
+			"help caused detectOS=%d, detectSSH=%d, resolver=%d, queries=%v, commands=%v",
 			recorder.detected,
+			recorder.sshPortCalls,
+			recorder.dockerGroupCalls,
+			recorder.queries,
+			recorder.commands,
+		)
+	}
+}
+
+func TestInstallFail2banHelpDisclosesDefaultPolicy(t *testing.T) {
+	recorder := newInstallRecorder(nil)
+	output, err := executeInstall(t, recorder, "fail2ban", "--help")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	for _, want := range []string{
+		"Ubuntu's default SSH jail",
+		"nftables",
+		"/usr/sbin/sshd -T",
+		"effective SSH port",
+		"managed",
+		"--ssh-port",
+		"does not change sshd",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("help output %q does not contain %q", output, want)
+		}
+	}
+	if recorder.detected != 0 || recorder.sshPortCalls != 0 || recorder.dockerGroupCalls != 0 || len(recorder.queries) != 0 || len(recorder.commands) != 0 {
+		t.Errorf(
+			"help caused detectOS=%d, detectSSH=%d, resolver=%d, queries=%v, commands=%v",
+			recorder.detected,
+			recorder.sshPortCalls,
 			recorder.dockerGroupCalls,
 			recorder.queries,
 			recorder.commands,
@@ -595,7 +818,7 @@ func TestInstallStopsAtFailedStep(t *testing.T) {
 }
 
 func TestInstallRejectsArguments(t *testing.T) {
-	for _, subcommand := range []string{"docker", "nginx"} {
+	for _, subcommand := range []string{"docker", "nginx", "fail2ban"} {
 		t.Run(subcommand, func(t *testing.T) {
 			recorder := newInstallRecorder(nil)
 			_, err := executeInstall(t, recorder, subcommand, "unexpected")
@@ -646,6 +869,25 @@ func TestInstallPassesCommandContext(t *testing.T) {
 	}
 }
 
+func TestInstallFail2banPassesCommandContextToSSHDetection(t *testing.T) {
+	type contextKey string
+	ctx := context.WithValue(context.Background(), contextKey("test"), "value")
+	plan := mustFail2banPlan(t, 22)
+	recorder := newInstallRecorder(installedStatuses(plan.RequiredPackages))
+	command := newInstallCmd(recorder.dependencies())
+	command.SetContext(ctx)
+	command.SetOut(&bytes.Buffer{})
+	command.SetErr(&bytes.Buffer{})
+	command.SetArgs([]string{"fail2ban"})
+
+	if err := command.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(recorder.sshPortContexts) != 1 || recorder.sshPortContexts[0] != ctx {
+		t.Errorf("SSH port detection contexts = %v, want command context", recorder.sshPortContexts)
+	}
+}
+
 func executeInstall(t *testing.T, recorder *installRecorder, args ...string) (string, error) {
 	t.Helper()
 	command := newInstallCmd(recorder.dependencies())
@@ -662,6 +904,15 @@ func mustDockerPlan(t *testing.T) installer.Plan {
 	plan, err := installer.Docker(osrelease.Info{ID: "ubuntu", VersionID: "24.04"}, "amd64")
 	if err != nil {
 		t.Fatalf("installer.Docker() error = %v", err)
+	}
+	return plan
+}
+
+func mustFail2banPlan(t *testing.T, sshPorts ...int) installer.Plan {
+	t.Helper()
+	plan, err := installer.Fail2banWithSSHPorts(sshPorts)
+	if err != nil {
+		t.Fatalf("installer.Fail2banWithSSHPorts() error = %v", err)
 	}
 	return plan
 }

@@ -51,3 +51,26 @@ func RunInputContext(ctx context.Context, argv []string, stdin io.Reader) error 
 	}
 	return nil
 }
+
+// OutputContext executes argv with terminal input and stderr attached, and
+// returns stdout for structured parsing. Non-root callers are elevated.
+func OutputContext(ctx context.Context, argv []string) ([]byte, error) {
+	if len(argv) == 0 {
+		return nil, fmt.Errorf("empty command")
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("nil command context")
+	}
+	if os.Geteuid() != 0 {
+		argv = WithSudo(argv)
+	}
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("run %s: %w", argv[0], err)
+	}
+	return output, nil
+}

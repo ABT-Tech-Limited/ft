@@ -28,3 +28,27 @@ func TestRunInputContextRejectsEmptyCommand(t *testing.T) {
 		t.Errorf("RunInputContext() error = %q, want it to contain %q", err, "empty command")
 	}
 }
+
+func TestOutputContextRejectsInvalidInput(t *testing.T) {
+	tests := []struct {
+		name    string
+		ctx     context.Context
+		argv    []string
+		wantErr string
+	}{
+		{name: "empty command", ctx: context.Background(), wantErr: "empty command"},
+		{name: "nil context", argv: []string{"true"}, wantErr: "nil command context"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			output, err := OutputContext(tt.ctx, tt.argv)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("OutputContext() output=%q error=%v, want error containing %q", output, err, tt.wantErr)
+			}
+			if output != nil {
+				t.Errorf("OutputContext() output = %q, want nil", output)
+			}
+		})
+	}
+}
