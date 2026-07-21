@@ -10,12 +10,49 @@
 从 [Releases](https://github.com/ABT-Tech-Limited/ft/releases) 下载对应架构的压缩包：
 
 ```bash
-# amd64（x86_64）
-curl -fsSL https://github.com/ABT-Tech-Limited/ft/releases/latest/download/ft_$(curl -fsSL https://api.github.com/repos/ABT-Tech-Limited/ft/releases/latest | grep -oP '"tag_name": "v\K[^"]+')_linux_amd64.tar.gz | tar -xz
-sudo install ft /usr/local/bin/ft
+(
+	set -eu
+	tmp_dir="$(mktemp -d)"
+	trap 'rm -rf "$tmp_dir"' EXIT
+
+	case "$(uname -m)" in
+		x86_64) arch="amd64" ;;
+		aarch64|arm64) arch="arm64" ;;
+		*) echo "不支持的架构: $(uname -m)" >&2; exit 1 ;;
+	esac
+
+	curl --proto '=https' --proto-redir '=https' -fsSL \
+		https://api.github.com/repos/ABT-Tech-Limited/ft/releases/latest \
+		-o "$tmp_dir/release.json"
+	version="$(sed -n 's/.*"tag_name":[[:space:]]*"v\([^"]*\)".*/\1/p' "$tmp_dir/release.json")"
+	case "$version" in
+		""|*[!0-9A-Za-z.+-]*) echo "无法获取有效的最新版本号" >&2; exit 1 ;;
+	esac
+
+	archive="ft_${version}_linux_${arch}.tar.gz"
+	curl --proto '=https' --proto-redir '=https' -fsSL \
+		"https://github.com/ABT-Tech-Limited/ft/releases/latest/download/$archive" \
+		-o "$tmp_dir/$archive"
+	curl --proto '=https' --proto-redir '=https' -fsSL \
+		"https://github.com/ABT-Tech-Limited/ft/releases/latest/download/checksums.txt" \
+		-o "$tmp_dir/checksums.txt"
+
+	expected="$(
+		awk -v name="$archive" '
+			$2 == name { count++; hash = $1 }
+			END { if (count != 1) exit 1; print hash }
+		' "$tmp_dir/checksums.txt"
+	)"
+	actual="$(sha256sum "$tmp_dir/$archive")"
+	actual="${actual%% *}"
+	[ "$actual" = "$expected" ] || { echo "SHA-256 校验失败" >&2; exit 1; }
+
+	tar -xzf "$tmp_dir/$archive" -C "$tmp_dir" ft
+	sudo install -m 0755 -- "$tmp_dir/ft" /usr/local/bin/ft
+)
 ```
 
-或手动下载 `ft_<version>_linux_<amd64|arm64>.tar.gz` 解压后放入 `PATH`。
+或手动下载 `ft_<version>_linux_<amd64|arm64>.tar.gz`，仅提取其中的 `ft`（例如 `tar -xzf <压缩包> ft`），再放入 `PATH`。
 
 ## 用法
 
@@ -24,6 +61,7 @@ ft init                # 初始化系统
 ft install docker      # 安装并启动 Docker Engine
 ft install nginx       # 安装并启动 Nginx
 ft install fail2ban    # 安装并启动 Fail2Ban SSH 防护
+ft update              # 更新到最新稳定版
 ft version             # 查看版本
 ft --help              # 查看全部命令
 ```
@@ -135,6 +173,18 @@ sudo fail2ban-client status sshd
 
 三个安装命令都会先校验操作系统；每一步实时透传输出，任一步失败立即停止并保留底层退出码。
 
+## 更新 ft
+
+```bash
+ft update
+```
+
+该命令查询 `ABT-Tech-Limited/ft` 的 GitHub Latest Release。只有远端稳定版语义版本高于当前版本时才更新；版本相同或本地版本更高时不会下载或替换文件，draft 和 prerelease 不参与自动更新。
+
+更新时，ft 会根据当前架构选择 `linux_amd64` 或 `linux_arm64` 的 GoReleaser 压缩包，同时下载 `checksums.txt`。压缩包必须通过 SHA-256 校验，并且只会从安全的 tar.gz 结构中提取唯一的顶层普通文件 `ft`。校验、解压或下载任一步失败都不会修改当前二进制。
+
+验证完成后，ft 在当前可执行文件所在目录创建临时文件，再通过原子重命名完成替换。如果安装位置（例如 `/usr/local/bin/ft`）需要更高权限，命令会自动调用 `sudo` 执行同样的暂存和原子替换流程。`dev` 构建会拒绝自更新；请先安装正式 Release。当前自更新仅支持 Linux `amd64` 和 `arm64`。
+
 ## 开发
 
 ```bash
@@ -146,13 +196,14 @@ go vet ./...     # 静态检查
 目录结构：
 
 ```
-cmd/                  # cobra 子命令（root、init、install、version）
+cmd/                  # cobra 子命令（root、init、install、update、version）
 internal/osrelease/   # /etc/os-release 解析与支持性判断
 internal/aptx/        # apt-get 命令构建与兼容执行接口
 internal/dpkgx/       # dpkg 包安装状态查询
 internal/installer/   # Docker/Nginx/Fail2Ban 安装步骤构建
 internal/sshx/        # OpenSSH 有效端口检测与解析
 internal/sysx/        # context-aware 特权命令执行
+internal/updater/     # GitHub Release 检查、校验与原子自更新
 internal/userx/       # 调用用户身份解析与校验
 ```
 

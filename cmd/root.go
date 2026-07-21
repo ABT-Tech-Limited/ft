@@ -7,6 +7,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var buildVersion = "dev"
+
 var rootCmd = &cobra.Command{
 	Use:   "ft",
 	Short: "ft wraps common ops commands for Linux servers",
@@ -20,6 +22,7 @@ supports Ubuntu 24.04 / 26.04, with more distributions to come.`,
 
 // SetVersionInfo records build metadata injected by GoReleaser.
 func SetVersionInfo(version, commit, date string) {
+	buildVersion = version
 	rootCmd.Version = fmt.Sprintf("%s (commit %s, built %s)", version, commit, date)
 }
 
