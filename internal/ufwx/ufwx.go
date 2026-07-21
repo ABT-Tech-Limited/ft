@@ -86,6 +86,17 @@ func ruleAllowsPort(line string, port int) bool {
 	default:
 		return false
 	}
+	// ufw renders the direction as a separate token after the action:
+	// outbound rules read "ALLOW OUT" and routed rules "ALLOW FWD", neither
+	// of which admits inbound traffic. Only inbound rules (no token, or
+	// "IN") count; treating OUT/FWD as an allow would risk locking the user
+	// out while the port is still blocked inbound.
+	if len(fields) > 2 {
+		switch fields[2] {
+		case "OUT", "FWD":
+			return false
+		}
+	}
 	return portSpecCovers(fields[0], port)
 }
 

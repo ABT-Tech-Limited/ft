@@ -107,6 +107,36 @@ func TestParseStatus(t *testing.T) {
 			port:   10222,
 			want:   Report{Active: true, PortAllowed: true},
 		},
+		{
+			name:   "outbound allow does not count as inbound",
+			output: activeStatus("10222/tcp                  ALLOW OUT   Anywhere"),
+			port:   10222,
+			want:   Report{Active: true},
+		},
+		{
+			name:   "routed allow does not count as inbound",
+			output: activeStatus("10222/tcp                  ALLOW FWD   Anywhere"),
+			port:   10222,
+			want:   Report{Active: true},
+		},
+		{
+			name:   "inbound allow with IN token still allows",
+			output: activeStatus("10222/tcp                  ALLOW IN    Anywhere"),
+			port:   10222,
+			want:   Report{Active: true, PortAllowed: true},
+		},
+		{
+			name:   "comma range list matches port",
+			output: activeStatus("80,10000:10300/tcp         ALLOW       Anywhere"),
+			port:   10222,
+			want:   Report{Active: true, PortAllowed: true},
+		},
+		{
+			name:   "udp range does not match tcp port",
+			output: activeStatus("10000:10300/udp            ALLOW       Anywhere"),
+			port:   10222,
+			want:   Report{Active: true},
+		},
 		{name: "missing status line", output: "garbage\n", port: 10222, wantErr: "no ufw status line"},
 		{name: "unknown status value", output: "Status: mystery\n", port: 10222, wantErr: "unknown ufw status"},
 	}
