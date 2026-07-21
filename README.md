@@ -61,6 +61,8 @@ ft init                # 初始化系统
 ft install docker      # 安装并启动 Docker Engine
 ft install nginx       # 安装并启动 Nginx
 ft install fail2ban    # 安装并启动 Fail2Ban SSH 防护
+ft ssh port            # 查看当前生效的 SSH 端口
+ft ssh port 10222      # 修改 SSH 端口（校验后重启，自动同步 fail2ban，检测 ufw）
 ft update              # 更新到最新稳定版
 ft version             # 查看版本
 ft --help              # 查看全部命令
@@ -172,6 +174,22 @@ sudo fail2ban-client status sshd
 安装前会通过 `dpkg-query` 检查 `fail2ban` 和 `nftables`；两者都完整安装时跳过 apt 更新和包安装，但仍会校验配置并确保服务运行。任一包缺失或处于半配置状态时执行完整安装流程。
 
 三个安装命令都会先校验操作系统；每一步实时透传输出，任一步失败立即停止并保留底层退出码。
+
+### 修改 SSH 端口
+
+```bash
+ft ssh port 10222
+```
+
+写入 ft 托管的 drop-in 配置 `/etc/ssh/sshd_config.d/00-ft-port.conf`（不改动主配置文件），
+依次执行：`sshd -t` 语法校验 → `sshd -T` 复核生效端口 → `systemctl daemon-reload` →
+重启 SSH（自动兼容 socket activation）。校验失败会恢复原配置且**不重启**，零锁死风险。
+
+- fail2ban 已安装时自动同步 ft 托管的 SSH jail 端口。
+- ufw 启用且新端口未放行时拒绝执行（先 `sudo ufw allow <端口>/tcp` 再重试）；ft 不修改防火墙规则。
+- 改完后请保持当前会话，先在新终端用 `ssh -p <端口> user@host` 验证连通再退出。
+
+不带参数运行 `ft ssh port` 可查看当前生效端口。
 
 ## 更新 ft
 

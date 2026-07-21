@@ -457,3 +457,103 @@ func TestSSHPortChangeInvalidArgumentRejectedEarly(t *testing.T) {
 		})
 	}
 }
+
+func TestSSHPortChangeBrokenFail2banWarnsAndSkips(t *testing.T) {
+	recorder := newSSHRecorder()
+	recorder.statuses = map[string]dpkgx.Status{"fail2ban": dpkgx.Broken}
+	recorder.sshPorts = [][]int{{22}, {10222}}
+	output, err := executeSSH(t, recorder, "port", "10222")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(output, "broken package state; skipped SSH jail sync") {
+		t.Errorf("output %q does not contain broken fail2ban warning", output)
+	}
+	for _, command := range recorder.commands {
+		if command.argv[0] == "/usr/bin/fail2ban-client" || strings.Contains(command.input, "[sshd]") {
+			t.Errorf("broken fail2ban still synced: %v", recorder.commands)
+		}
+	}
+}
+
+func TestSSHPortChangeStopsWhenQueryFails(t *testing.T) {
+	wantErr := errors.New("dpkg query failed")
+	recorder := newSSHRecorder()
+	recorder.queryErr = wantErr
+	_, err := executeSSH(t, recorder, "port", "10222")
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Execute() error = %v, want errors.Is(_, wantErr)", err)
+	}
+	if len(recorder.commands) != 0 {
+		t.Errorf("query failure ran commands %v, want none", recorder.commands)
+	}
+}
+
+func TestSSHPortChangeStopsWhenFileCheckFails(t *testing.T) {
+	wantErr := errors.New("stat failed")
+	recorder := newSSHRecorder()
+	recorder.fileExistsErr = wantErr
+	recorder.sshPorts = [][]int{{22}}
+	_, err := executeSSH(t, recorder, "port", "10222")
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Execute() error = %v, want errors.Is(_, wantErr)", err)
+	}
+	if len(recorder.commands) != 0 {
+		t.Errorf("stat failure ran commands %v, want none", recorder.commands)
+	}
+}
+
+func TestSSHPortChangeRestartFailureExplainsRecovery(t *testing.T) {
+	recorder := newSSHRecorder()
+	recorder.sshPorts = [][]int{{22}, {10222}}
+	recorder.runErrorAt = 4 // PortSteps(3) + SyntaxCheckStep(1), then daemon-reload fails
+	recorder.runErr = errors.New("daemon-reload failed")
+	_, err := executeSSH(t, recorder, "port", "10222")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want restart failure")
+	}
+	for _, want := range []string{"journalctl -u ssh", "session stays alive", sshx.PortConfigPath} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Execute() error = %q, want %q", err, want)
+		}
+	}
+}
+
+func TestSSHPortChangePassesCommandContext(t *testing.T) {
+	type contextKey string
+	ctx := context.WithValue(context.Background(), contextKey("test"), "value")
+	recorder := newSSHRecorder()
+	recorder.sshPorts = [][]int{{22}, {10222}}
+	command := newSSHCmd(recorder.dependencies())
+	command.SetContext(ctx)
+	command.SetOut(&bytes.Buffer{})
+	command.SetErr(&bytes.Buffer{})
+	command.SetArgs([]string{"port", "10222"})
+	if err := command.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+}
+
+func TestSSHPortHelpDisclosesSafetyModel(t *testing.T) {
+	recorder := newSSHRecorder()
+	output, err := executeSSH(t, recorder, "port", "--help")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	for _, want := range []string{
+		sshx.PortConfigPath,
+		"never modified",
+		"sshd -t",
+		"restored and SSH is not restarted",
+		"ft does not change",
+		"firewall rules",
+		"Keep your current session open",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("help output %q does not contain %q", output, want)
+		}
+	}
+	if recorder.detected != 0 || len(recorder.commands) != 0 {
+		t.Errorf("help caused detectOS=%d commands=%v", recorder.detected, recorder.commands)
+	}
+}
