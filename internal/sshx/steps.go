@@ -9,10 +9,15 @@ import (
 
 const sshdConfigDir = "/etc/ssh/sshd_config.d"
 
-// PortConfigPath is the ft-managed sshd port drop-in. The 00- prefix is
-// load-bearing: sshd honours the first Port value it sees (first-match
-// wins), so this file must sort before 50-cloud-init.conf and friends —
-// the opposite direction from fail2ban's last-wins zz- prefix in jail.d.
+// PortConfigPath is the ft-managed sshd port drop-in. sshd Port directives
+// ACCUMULATE across sshd_config and its drop-ins: every Port listed is
+// listened on, and there is no first-match rule. The 00- prefix is
+// therefore not load-bearing for correctness; it only sorts ft's file early
+// for predictable ordering. The guarantee that the target port is the ONLY
+// active one comes from the sshd -T verification step, which rejects the
+// change and rolls back when stray Port directives remain elsewhere.
+// (Contrast fail2ban's zz- jail.d prefix, which relies on a genuinely
+// last-wins mechanism.)
 const PortConfigPath = sshdConfigDir + "/00-ft-port.conf"
 
 func portConfigTempPath() string {

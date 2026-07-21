@@ -134,14 +134,25 @@ func runSSHPortChange(cmd *cobra.Command, deps sshDependencies, port int) error 
 		}
 	}
 
-	if err := syncFail2banSSHPort(cmd, deps, statuses["fail2ban"], port); err != nil {
-		return err
-	}
-
+	// Print the safety reminder BEFORE syncing fail2ban: sshd has already
+	// restarted onto the new port by now, so a fail2ban sync failure must not
+	// swallow the "keep this session open" guidance. The text is correct on
+	// the idempotent path too, so ordering it unconditionally is fine.
 	fmt.Fprintf(out, "\nSSH port is set to %d.\n", port)
 	fmt.Fprintln(out, "IMPORTANT: keep this session open. From a new terminal, verify that")
 	fmt.Fprintf(out, "\"ssh -p %d user@host\" works before you disconnect.\n", port)
-	fmt.Fprintln(out, "If an old ufw rule still allows the previous port, remove it after verifying.")
+	// Old ufw rules for the previous port stay in place; ft never edits the
+	// firewall. Print a concrete delete example for each replaced port.
+	for _, old := range currentPorts {
+		if old == port {
+			continue
+		}
+		fmt.Fprintf(out, "Old-port cleanup example: sudo ufw delete allow %d/tcp\n", old)
+	}
+
+	if err := syncFail2banSSHPort(cmd, deps, statuses["fail2ban"], port); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -195,7 +206,7 @@ func verifySSHConfiguration(cmd *cobra.Command, deps sshDependencies, port int) 
 	}
 	if len(ports) != 1 || ports[0] != port {
 		return fmt.Errorf(
-			"sshd still reports port(s) %s instead of %d; another configuration file takes precedence over %s",
+			"sshd reports port(s) %s instead of %d alone; Port values accumulate across sshd_config and its drop-ins — remove the other Port directives, then retry (ft manages only %s)",
 			joinPorts(ports), port, sshx.PortConfigPath,
 		)
 	}

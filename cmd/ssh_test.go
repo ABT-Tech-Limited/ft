@@ -34,6 +34,13 @@ type sshRecorder struct {
 	commands      []recordedInstallCommand
 	runErrorAt    int
 	runErr        error
+
+	// Recorded contexts, parallel to the call slices above, so tests can
+	// assert the command context propagates into every dependency.
+	sshPortContexts []context.Context
+	queryContexts   []context.Context
+	outputContexts  []context.Context
+	runContexts     []context.Context
 }
 
 func newSSHRecorder() *sshRecorder {
@@ -54,6 +61,7 @@ func (r *sshRecorder) dependencies() sshDependencies {
 			return osrelease.Info{ID: "ubuntu", VersionID: "24.04"}, nil
 		},
 		detectSSHPorts: func(ctx context.Context) ([]int, error) {
+			r.sshPortContexts = append(r.sshPortContexts, ctx)
 			index := r.sshPortCalls
 			r.sshPortCalls++
 			if index >= len(r.sshPorts) {
@@ -66,6 +74,7 @@ func (r *sshRecorder) dependencies() sshDependencies {
 			return append([]int(nil), r.sshPorts[index]...), err
 		},
 		queryPackages: func(ctx context.Context, packages ...string) (map[string]dpkgx.Status, error) {
+			r.queryContexts = append(r.queryContexts, ctx)
 			r.queries = append(r.queries, append([]string(nil), packages...))
 			if r.queryErr != nil {
 				return nil, r.queryErr
@@ -81,6 +90,7 @@ func (r *sshRecorder) dependencies() sshDependencies {
 			return r.fileExists, r.fileExistsErr
 		},
 		output: func(ctx context.Context, argv []string) ([]byte, error) {
+			r.outputContexts = append(r.outputContexts, ctx)
 			r.outputCalls = append(r.outputCalls, append([]string(nil), argv...))
 			if len(argv) > 0 && argv[0] == "ufw" {
 				return []byte(r.ufwOutput), r.ufwErr
@@ -88,6 +98,7 @@ func (r *sshRecorder) dependencies() sshDependencies {
 			return nil, r.socketErr
 		},
 		run: func(ctx context.Context, argv []string, stdin io.Reader) error {
+			r.runContexts = append(r.runContexts, ctx)
 			var input []byte
 			if stdin != nil {
 				var err error
@@ -223,6 +234,7 @@ func TestSSHPortChangeHappyPathWithoutPreviousConfig(t *testing.T) {
 		"SSH port is set to 10222.",
 		"keep this session open",
 		"ssh -p 10222",
+		"Old-port cleanup example: sudo ufw delete allow 22/tcp",
 		"Fail2Ban is not installed; skipped SSH jail sync.",
 	} {
 		if !strings.Contains(output, wantText) {
@@ -387,8 +399,13 @@ func TestSSHPortChangeRollsBackWhenEffectivePortMismatch(t *testing.T) {
 	recorder := newSSHRecorder()
 	recorder.sshPorts = [][]int{{22}, {22}} // verification still reports 22
 	_, err := executeSSH(t, recorder, "port", "10222")
-	if err == nil || !strings.Contains(err.Error(), "still reports port(s) 22") {
-		t.Fatalf("Execute() error = %v, want mismatch error", err)
+	if err == nil {
+		t.Fatalf("Execute() error = nil, want mismatch error")
+	}
+	for _, want := range []string{"port(s) 22", "Port values accumulate"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Execute() error = %q, want %q", err, want)
+		}
 	}
 	last := recorder.commands[len(recorder.commands)-1]
 	if !reflect.DeepEqual(last.argv, sshx.RemoveConfigStep().Argv) {
@@ -523,6 +540,10 @@ func TestSSHPortChangePassesCommandContext(t *testing.T) {
 	type contextKey string
 	ctx := context.WithValue(context.Background(), contextKey("test"), "value")
 	recorder := newSSHRecorder()
+	// Exercise every dependency: ufw active (output + inspect), full sshd
+	// flow (run + detectSSHPorts before/verify), and fail2ban sync (run).
+	recorder.statuses = map[string]dpkgx.Status{"ufw": dpkgx.Installed, "fail2ban": dpkgx.Installed}
+	recorder.ufwOutput = "Status: active\n\nTo   Action   From\n--   ------   ----\n10222/tcp   ALLOW   Anywhere\n"
 	recorder.sshPorts = [][]int{{22}, {10222}}
 	command := newSSHCmd(recorder.dependencies())
 	command.SetContext(ctx)
@@ -532,6 +553,20 @@ func TestSSHPortChangePassesCommandContext(t *testing.T) {
 	if err := command.Execute(); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
+	assertContexts := func(name string, got []context.Context) {
+		if len(got) == 0 {
+			t.Errorf("%s recorded no contexts, want the command context propagated", name)
+		}
+		for i, c := range got {
+			if c != ctx {
+				t.Errorf("%s context[%d] = %v, want injected command context", name, i, c)
+			}
+		}
+	}
+	assertContexts("detectSSHPorts", recorder.sshPortContexts)
+	assertContexts("queryPackages", recorder.queryContexts)
+	assertContexts("output", recorder.outputContexts)
+	assertContexts("run", recorder.runContexts)
 }
 
 func TestSSHPortHelpDisclosesSafetyModel(t *testing.T) {
