@@ -63,7 +63,7 @@ ft install nginx       # 安装并启动 Nginx
 ft install fail2ban    # 安装并启动 Fail2Ban SSH 防护
 ft ssh port            # 查看当前生效的 SSH 端口
 ft ssh port 10222      # 修改 SSH 端口（校验后重启，自动同步 fail2ban，检测 ufw）
-ft ufw only-cloudflare # 仅允许 Cloudflare IP 访问 80/443（Docker 场景要求 ufw-docker）
+ft ufw cloudflare      # 仅允许 Cloudflare IP 访问 80/443，自动注册每小时刷新
 ft update              # 更新到最新稳定版
 ft version             # 查看版本
 ft --help              # 查看全部命令
@@ -195,7 +195,7 @@ ft ssh port 10222
 ### 仅允许 Cloudflare 访问 80/443
 
 ```bash
-ft ufw only-cloudflare
+ft ufw cloudflare
 ```
 
 拉取 Cloudflare 官方 IP 段（`https://www.cloudflare.com/ips-v4` 与 `ips-v6`），把 TCP 80/443 收紧为仅 Cloudflare 可访问：
@@ -204,14 +204,15 @@ ft ufw only-cloudflare
 2. 为每个 Cloudflare 段添加 `ufw allow proto tcp from <段> to any port 80,443`，并用注释 `ft-cloudflare` 标记为 ft 托管；
 3. `ufw reload` 生效。
 
-重复执行即刷新：托管规则按最新列表整体重建。Cloudflare 会不定期调整 IP 段，建议定期重跑本命令。
+**自动保持最新**：命令成功后会把自己注册到 `/etc/cron.d/ft-ufw-cloudflare`，每小时（第 17 分钟）自动重跑一次，输出追加到 `/var/log/ft-ufw-cloudflare.log`。托管规则与最新列表一致时不做任何改动（避免每小时无谓重建规则），列表变化时才整体重建。删除该 cron 文件即可停用自动刷新；`cron` 包未安装时跳过注册并给出提示。
+
+**Docker 自动处理**：Docker 发布端口直接走 iptables、绕过 ufw 的 INPUT 链，普通 ufw 规则拦不住 Docker 端口。检测到已安装 Docker 而 [ufw-docker](https://github.com/chaifeng/ufw-docker) 尚未配置时，ft 会自动下载**固定 commit 且校验 SHA-256** 的 ufw-docker 脚本到 `/usr/local/bin/ufw-docker`，执行 `ufw-docker install` 并重启 ufw，然后同时维护 `ufw route allow` 规则，把 Docker 发布的 80/443 一并收紧。注意：ufw-docker 安装后，Docker 发布的**其他**端口也会默认拒绝外部访问，需要放行时用 `ufw-docker allow <容器> <端口>` 或 `ufw route allow`。
 
 执行前置条件（任一不满足都会明确报错退出，防火墙零改动）：
 
 - ufw 已安装且 active。ft 不会代跑 `sudo ufw enable`——请先自行放行 SSH 端口再启用防火墙。
 - 默认入站策略为 deny/reject，否则其他 IP 依旧能进；可先执行 `sudo ufw default deny incoming`（确认 SSH 端口已放行）。
-- 已安装 Docker 时必须先安装 [ufw-docker](https://github.com/chaifeng/ufw-docker)：Docker 发布端口直接走 iptables、绕过 ufw 的 INPUT 链，普通 ufw 规则拦不住 Docker 端口。检测到 ufw-docker 后，ft 会同时添加 `ufw route allow` 规则，把 Docker 发布的 80/443 一并收紧；未安装则拒绝执行，避免制造「已受保护」的假象。
-- Cloudflare 列表拉取或校验失败（数量异常、混入非法条目等）时立即中止。
+- Cloudflare 列表拉取或校验失败（数量异常、混入非法条目等）、ufw-docker 下载校验失败时立即中止。
 
 放行全部端口的规则（如管理 IP 白名单）与可能挡住 Cloudflare 的 DENY/REJECT 规则不会被删除，但会在收尾时提示人工复查。SSH 及其他端口的规则一律不动。云安全组等 ufw 之外的防火墙不在管理范围，需自行确认放行 Cloudflare。
 
