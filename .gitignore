@@ -34,4 +34,5 @@ dist/
 # Editor/IDE
 # .idea/
 # .vscode/
-docs/
+docs/plans/
+docs/superpowers/
