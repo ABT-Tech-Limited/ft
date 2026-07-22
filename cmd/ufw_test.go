@@ -21,6 +21,10 @@ const (
 	testVerboseActive = "Status: active\nLogging: on (low)\nDefault: deny (incoming), allow (outgoing), disabled (routed)\n"
 
 	testNumberedClean = "Status: active\n\n     To                         Action      From\n     --                         ------      ----\n[ 1] 22/tcp                     ALLOW IN    Anywhere\n"
+
+	testUFWDockerMarker = "# BEGIN UFW AND DOCKER\n-A DOCKER-USER -j RETURN\n# END UFW AND DOCKER\n"
+
+	testExecutable = "/usr/local/bin/ft"
 )
 
 var testSortedRanges = []string{
@@ -33,39 +37,67 @@ var testSortedRanges = []string{
 	"2606:4700::/32",
 }
 
+// testNumberedInSync lists exactly the managed rules matching testSortedRanges
+// on the INPUT chain, plus an unrelated SSH rule.
+const testNumberedInSync = "Status: active\n" +
+	"[ 1] 22/tcp                     ALLOW IN    Anywhere\n" +
+	"[ 2] 80,443/tcp                 ALLOW IN    103.21.244.0/22            # ft-cloudflare\n" +
+	"[ 3] 80,443/tcp                 ALLOW IN    108.162.192.0/18           # ft-cloudflare\n" +
+	"[ 4] 80,443/tcp                 ALLOW IN    141.101.64.0/18            # ft-cloudflare\n" +
+	"[ 5] 80,443/tcp                 ALLOW IN    173.245.48.0/20            # ft-cloudflare\n" +
+	"[ 6] 80,443/tcp                 ALLOW IN    190.93.240.0/20            # ft-cloudflare\n" +
+	"[ 7] 80,443/tcp (v6)            ALLOW IN    2400:cb00::/32             # ft-cloudflare\n" +
+	"[ 8] 80,443/tcp (v6)            ALLOW IN    2606:4700::/32             # ft-cloudflare\n"
+
+type afterRulesResponse struct {
+	content string
+	err     error
+}
+
 type ufwRecorder struct {
-	statuses      map[string]dpkgx.Status
-	detectErr     error
-	queryErr      error
-	queries       [][]string
-	verboseOutput string
-	verboseErr    error
-	afterRules    string
-	afterRulesErr error
-	numbered      []string // consumed per status-numbered call; last entry repeats
-	numberedCalls int
-	appInfo       map[string]string
-	appInfoErr    error
-	outputCalls   [][]string
-	commands      []recordedInstallCommand
-	runErrorAt    int
-	runErr        error
-	v4            string
-	v6            string
-	v4Err         error
-	v6Err         error
-	fetchCalls    []string
+	statuses        map[string]dpkgx.Status
+	detectErr       error
+	queryErr        error
+	queries         [][]string
+	verboseOutput   string
+	verboseErr      error
+	afterRules      []afterRulesResponse // consumed per cat call; last entry repeats
+	afterRulesCalls int
+	numbered        []string // consumed per status-numbered call; last entry repeats
+	numberedCalls   int
+	appInfo         map[string]string
+	appInfoErr      error
+	sha256Output    string
+	sha256Err       error
+	outputCalls     [][]string
+	commands        []recordedInstallCommand
+	runErrorAt      int
+	runErr          error
+	executablePath  string
+	executableErr   error
+	v4              string
+	v6              string
+	v4Err           error
+	v6Err           error
+	fetchCalls      []string
 }
 
 func newUFWRecorder() *ufwRecorder {
 	return &ufwRecorder{
-		statuses:      map[string]dpkgx.Status{"ufw": dpkgx.Installed},
+		statuses: map[string]dpkgx.Status{
+			"ufw":  dpkgx.Installed,
+			"cron": dpkgx.Installed,
+		},
 		verboseOutput: testVerboseActive,
-		afterRulesErr: errors.New("cat: /etc/ufw/after.rules: No such file or directory"),
-		numbered:      []string{testNumberedClean},
-		v4:            testCloudflareV4,
-		v6:            testCloudflareV6,
-		runErrorAt:    -1,
+		afterRules: []afterRulesResponse{
+			{err: errors.New("cat: /etc/ufw/after.rules: No such file or directory")},
+		},
+		numbered:       []string{testNumberedClean},
+		sha256Output:   "643e56b080567c567b4aa28650196849b2a2da5dd0473fd3e5216b0886035ab0  /usr/local/bin/ufw-docker.tmp\n",
+		executablePath: testExecutable,
+		v4:             testCloudflareV4,
+		v6:             testCloudflareV6,
+		runErrorAt:     -1,
 	}
 }
 
@@ -102,7 +134,15 @@ func (r *ufwRecorder) dependencies() ufwDependencies {
 				}
 				return []byte(r.numbered[index]), nil
 			case key == "cat /etc/ufw/after.rules":
-				return []byte(r.afterRules), r.afterRulesErr
+				index := r.afterRulesCalls
+				r.afterRulesCalls++
+				if index >= len(r.afterRules) {
+					index = len(r.afterRules) - 1
+				}
+				response := r.afterRules[index]
+				return []byte(response.content), response.err
+			case key == "sha256sum /usr/local/bin/ufw-docker.tmp":
+				return []byte(r.sha256Output), r.sha256Err
 			case len(argv) == 4 && key == "ufw app info "+argv[3]:
 				if r.appInfoErr != nil {
 					return nil, r.appInfoErr
@@ -113,12 +153,26 @@ func (r *ufwRecorder) dependencies() ufwDependencies {
 			}
 		},
 		run: func(ctx context.Context, argv []string, stdin io.Reader) error {
+			var input []byte
+			if stdin != nil {
+				var err error
+				input, err = io.ReadAll(stdin)
+				if err != nil {
+					return err
+				}
+			}
 			current := len(r.commands)
-			r.commands = append(r.commands, recordedInstallCommand{argv: append([]string(nil), argv...)})
+			r.commands = append(r.commands, recordedInstallCommand{
+				argv:  append([]string(nil), argv...),
+				input: string(input),
+			})
 			if current == r.runErrorAt {
 				return r.runErr
 			}
 			return nil
+		},
+		executable: func() (string, error) {
+			return r.executablePath, r.executableErr
 		},
 		fetch: func(ctx context.Context, url string) ([]byte, error) {
 			r.fetchCalls = append(r.fetchCalls, url)
@@ -149,6 +203,28 @@ func routeAllowArgv(cidr string) []string {
 	return []string{"ufw", "route", "allow", "proto", "tcp", "from", cidr, "to", "any", "port", "80,443", "comment", "ft-cloudflare"}
 }
 
+func cronArgvs() [][]string {
+	return [][]string{
+		{"install", "-o", "root", "-g", "root", "-m", "0644", "/dev/stdin", "/etc/cron.d/ft-ufw-cloudflare.tmp"},
+		{"mv", "-f", "/etc/cron.d/ft-ufw-cloudflare.tmp", "/etc/cron.d/ft-ufw-cloudflare"},
+	}
+}
+
+func ufwDockerInstallArgvs() [][]string {
+	return [][]string{
+		{
+			"curl", "--fail", "--show-error", "--silent", "--location",
+			"--proto", "=https", "--tlsv1.2", "--remove-on-error",
+			"--output", "/usr/local/bin/ufw-docker.tmp",
+			"https://raw.githubusercontent.com/chaifeng/ufw-docker/020a8699f95592561f254d8d4ad1bb40d401dfc7/ufw-docker",
+		},
+		{"chmod", "0755", "/usr/local/bin/ufw-docker.tmp"},
+		{"mv", "-f", "/usr/local/bin/ufw-docker.tmp", "/usr/local/bin/ufw-docker"},
+		{"/usr/local/bin/ufw-docker", "install"},
+		{"systemctl", "restart", "ufw"},
+	}
+}
+
 func assertCommands(t *testing.T, got []recordedInstallCommand, want [][]string) {
 	t.Helper()
 	if len(got) != len(want) {
@@ -161,26 +237,35 @@ func assertCommands(t *testing.T, got []recordedInstallCommand, want [][]string)
 	}
 }
 
-func TestUFWOnlyCloudflareHappyPathWithoutDocker(t *testing.T) {
+func TestUFWCloudflareHappyPathWithoutDocker(t *testing.T) {
 	recorder := newUFWRecorder()
-	output, err := executeUFW(t, recorder, "only-cloudflare")
+	output, err := executeUFW(t, recorder, "cloudflare")
 	if err != nil {
 		t.Fatalf("Execute() error = %v\noutput:\n%s", err, output)
 	}
 
-	if want := [][]string{{"ufw", "docker-ce", "docker.io"}}; !reflect.DeepEqual(recorder.queries, want) {
+	if want := [][]string{{"ufw", "docker-ce", "docker.io", "cron"}}; !reflect.DeepEqual(recorder.queries, want) {
 		t.Errorf("package queries = %v, want %v", recorder.queries, want)
 	}
 	if want := []string{"https://www.cloudflare.com/ips-v4", "https://www.cloudflare.com/ips-v6"}; !reflect.DeepEqual(recorder.fetchCalls, want) {
 		t.Errorf("fetch calls = %v, want %v", recorder.fetchCalls, want)
 	}
 
-	want := make([][]string, 0, len(testSortedRanges)+1)
+	want := make([][]string, 0, len(testSortedRanges)+3)
 	for _, cidr := range testSortedRanges {
 		want = append(want, allowArgv(cidr))
 	}
 	want = append(want, []string{"ufw", "reload"})
+	want = append(want, cronArgvs()...)
 	assertCommands(t, recorder.commands, want)
+
+	cronContent := recorder.commands[len(recorder.commands)-2].input
+	if !strings.Contains(cronContent, `17 * * * * root "/usr/local/bin/ft" ufw cloudflare >> /var/log/ft-ufw-cloudflare.log 2>&1`) {
+		t.Errorf("cron file content %q does not contain the hourly entry", cronContent)
+	}
+	if !strings.Contains(cronContent, "Managed by ft") {
+		t.Errorf("cron file content %q lacks the managed-by marker", cronContent)
+	}
 
 	if !strings.Contains(output, "5 IPv4 + 2 IPv6") {
 		t.Errorf("output %q does not mention the range counts", output)
@@ -188,25 +273,25 @@ func TestUFWOnlyCloudflareHappyPathWithoutDocker(t *testing.T) {
 	if !strings.Contains(output, "No conflicting rules found.") {
 		t.Errorf("output %q does not mention the empty cleanup", output)
 	}
-	if !strings.Contains(output, "re-run") {
-		t.Errorf("output %q does not remind about refreshing ranges", output)
+	if !strings.Contains(output, "every hour") {
+		t.Errorf("output %q does not mention the hourly refresh", output)
 	}
 }
 
-func TestUFWOnlyCloudflareAddsRouteRulesWithUFWDocker(t *testing.T) {
+func TestUFWCloudflareAddsRouteRulesWithUFWDocker(t *testing.T) {
 	recorder := newUFWRecorder()
-	recorder.afterRules = "# BEGIN UFW AND DOCKER\n-A DOCKER-USER -j RETURN\n# END UFW AND DOCKER\n"
-	recorder.afterRulesErr = nil
-	output, err := executeUFW(t, recorder, "only-cloudflare")
+	recorder.afterRules = []afterRulesResponse{{content: testUFWDockerMarker}}
+	output, err := executeUFW(t, recorder, "cloudflare")
 	if err != nil {
 		t.Fatalf("Execute() error = %v\noutput:\n%s", err, output)
 	}
 
-	want := make([][]string, 0, 2*len(testSortedRanges)+1)
+	want := make([][]string, 0, 2*len(testSortedRanges)+3)
 	for _, cidr := range testSortedRanges {
 		want = append(want, allowArgv(cidr), routeAllowArgv(cidr))
 	}
 	want = append(want, []string{"ufw", "reload"})
+	want = append(want, cronArgvs()...)
 	assertCommands(t, recorder.commands, want)
 
 	if !strings.Contains(output, "ufw-docker") {
@@ -214,40 +299,119 @@ func TestUFWOnlyCloudflareAddsRouteRulesWithUFWDocker(t *testing.T) {
 	}
 }
 
-func TestUFWOnlyCloudflareRefusesDockerWithoutUFWDocker(t *testing.T) {
+func TestUFWCloudflareInstallsUFWDockerWhenDockerPresent(t *testing.T) {
 	for _, pkg := range []string{"docker-ce", "docker.io"} {
 		t.Run(pkg, func(t *testing.T) {
 			recorder := newUFWRecorder()
 			recorder.statuses[pkg] = dpkgx.Installed
-			_, err := executeUFW(t, recorder, "only-cloudflare")
-			if err == nil || !strings.Contains(err.Error(), "ufw-docker") {
-				t.Fatalf("Execute() error = %v, want ufw-docker guidance", err)
+			recorder.afterRules = []afterRulesResponse{
+				{content: "# regular ufw after rules\n"},
+				{content: testUFWDockerMarker},
 			}
-			if len(recorder.commands) != 0 {
-				t.Errorf("ran commands %v, want none", recorder.commands)
+			output, err := executeUFW(t, recorder, "cloudflare")
+			if err != nil {
+				t.Fatalf("Execute() error = %v\noutput:\n%s", err, output)
 			}
-			if len(recorder.fetchCalls) != 0 {
-				t.Errorf("fetched %v before refusing, want no fetches", recorder.fetchCalls)
+
+			want := ufwDockerInstallArgvs()
+			for _, cidr := range testSortedRanges {
+				want = append(want, allowArgv(cidr), routeAllowArgv(cidr))
+			}
+			want = append(want, []string{"ufw", "reload"})
+			want = append(want, cronArgvs()...)
+			assertCommands(t, recorder.commands, want)
+
+			checksumChecked := false
+			for _, call := range recorder.outputCalls {
+				if strings.Join(call, " ") == "sha256sum /usr/local/bin/ufw-docker.tmp" {
+					checksumChecked = true
+				}
+			}
+			if !checksumChecked {
+				t.Error("downloaded ufw-docker script was not checksum-verified")
+			}
+			if recorder.afterRulesCalls != 2 {
+				t.Errorf("read after.rules %d times, want 2 (detect + verify)", recorder.afterRulesCalls)
 			}
 		})
 	}
 }
 
-func TestUFWOnlyCloudflareProceedsWithDockerAndUFWDocker(t *testing.T) {
+func TestUFWCloudflareRejectsUFWDockerChecksumMismatch(t *testing.T) {
 	recorder := newUFWRecorder()
 	recorder.statuses["docker-ce"] = dpkgx.Installed
-	recorder.afterRules = "# BEGIN UFW AND DOCKER\n"
-	recorder.afterRulesErr = nil
-	_, err := executeUFW(t, recorder, "only-cloudflare")
-	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
+	recorder.afterRules = []afterRulesResponse{{content: "# no marker\n"}}
+	recorder.sha256Output = "deadbeef  /usr/local/bin/ufw-docker.tmp\n"
+	_, err := executeUFW(t, recorder, "cloudflare")
+	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("Execute() error = %v, want checksum mismatch", err)
 	}
-	if len(recorder.commands) != 2*len(testSortedRanges)+1 {
-		t.Errorf("ran %d commands, want %d", len(recorder.commands), 2*len(testSortedRanges)+1)
+	want := [][]string{
+		ufwDockerInstallArgvs()[0],
+		{"rm", "-f", "/usr/local/bin/ufw-docker.tmp"},
+	}
+	assertCommands(t, recorder.commands, want)
+}
+
+func TestUFWCloudflareFailsWhenUFWDockerInstallLeavesNoMarker(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.statuses["docker-ce"] = dpkgx.Installed
+	recorder.afterRules = []afterRulesResponse{{content: "# no marker\n"}}
+	_, err := executeUFW(t, recorder, "cloudflare")
+	if err == nil || !strings.Contains(err.Error(), "did not add") {
+		t.Fatalf("Execute() error = %v, want missing-marker failure", err)
+	}
+	assertCommands(t, recorder.commands, ufwDockerInstallArgvs())
+}
+
+func TestUFWCloudflareSkipsRebuildWhenRulesInSync(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.numbered = []string{testNumberedInSync}
+	output, err := executeUFW(t, recorder, "cloudflare")
+	if err != nil {
+		t.Fatalf("Execute() error = %v\noutput:\n%s", err, output)
+	}
+	assertCommands(t, recorder.commands, cronArgvs())
+	if !strings.Contains(output, "already match") {
+		t.Errorf("output %q does not mention the in-sync fast path", output)
+	}
+	if recorder.numberedCalls != 1 {
+		t.Errorf("queried numbered rules %d times, want 1", recorder.numberedCalls)
 	}
 }
 
-func TestUFWOnlyCloudflareGuards(t *testing.T) {
+func TestUFWCloudflareRebuildsWhenRouteRulesMissing(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.afterRules = []afterRulesResponse{{content: testUFWDockerMarker}}
+	recorder.numbered = []string{testNumberedInSync, testNumberedClean}
+	_, err := executeUFW(t, recorder, "cloudflare")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(recorder.commands) == 0 || !reflect.DeepEqual(recorder.commands[0].argv, []string{"ufw", "--force", "delete", "2"}) {
+		t.Fatalf("first command = %+v, want deletion of the stale managed rule", recorder.commands)
+	}
+}
+
+func TestUFWCloudflareSkipsCronWhenCronAbsent(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.statuses["cron"] = dpkgx.Absent
+	output, err := executeUFW(t, recorder, "cloudflare")
+	if err != nil {
+		t.Fatalf("Execute() error = %v\noutput:\n%s", err, output)
+	}
+	want := make([][]string, 0, len(testSortedRanges)+1)
+	for _, cidr := range testSortedRanges {
+		want = append(want, allowArgv(cidr))
+	}
+	want = append(want, []string{"ufw", "reload"})
+	assertCommands(t, recorder.commands, want)
+	if !strings.Contains(output, "not registered") {
+		t.Errorf("output %q does not warn about the missing cron package", output)
+	}
+}
+
+func TestUFWCloudflareGuards(t *testing.T) {
 	tests := []struct {
 		name    string
 		mutate  func(*ufwRecorder)
@@ -257,6 +421,11 @@ func TestUFWOnlyCloudflareGuards(t *testing.T) {
 			name:    "os detection failure",
 			mutate:  func(r *ufwRecorder) { r.detectErr = errors.New("unsupported system") },
 			wantErr: "unsupported system",
+		},
+		{
+			name:    "executable resolution failure",
+			mutate:  func(r *ufwRecorder) { r.executableErr = errors.New("proc unavailable") },
+			wantErr: "executable",
 		},
 		{
 			name:    "package query failure",
@@ -300,7 +469,7 @@ func TestUFWOnlyCloudflareGuards(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			recorder := newUFWRecorder()
 			tt.mutate(recorder)
-			_, err := executeUFW(t, recorder, "only-cloudflare")
+			_, err := executeUFW(t, recorder, "cloudflare")
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("Execute() error = %v, want it to contain %q", err, tt.wantErr)
 			}
@@ -311,10 +480,10 @@ func TestUFWOnlyCloudflareGuards(t *testing.T) {
 	}
 }
 
-func TestUFWOnlyCloudflareFetchFailureLeavesRulesUnread(t *testing.T) {
+func TestUFWCloudflareFetchFailureLeavesRulesUnread(t *testing.T) {
 	recorder := newUFWRecorder()
 	recorder.v6Err = errors.New("timeout")
-	_, err := executeUFW(t, recorder, "only-cloudflare")
+	_, err := executeUFW(t, recorder, "cloudflare")
 	if err == nil || !strings.Contains(err.Error(), "fetching Cloudflare IPv6 list") {
 		t.Fatalf("Execute() error = %v, want fetch failure", err)
 	}
@@ -325,7 +494,7 @@ func TestUFWOnlyCloudflareFetchFailureLeavesRulesUnread(t *testing.T) {
 	}
 }
 
-func TestUFWOnlyCloudflareDeletesConflictingRules(t *testing.T) {
+func TestUFWCloudflareDeletesConflictingRules(t *testing.T) {
 	recorder := newUFWRecorder()
 	recorder.appInfo = map[string]string{"Nginx Full": "Profile: Nginx Full\n\nPorts:\n  80,443/tcp\n"}
 	recorder.numbered = []string{
@@ -343,7 +512,7 @@ func TestUFWOnlyCloudflareDeletesConflictingRules(t *testing.T) {
 			"[ 2] 80,443/tcp                 ALLOW IN    198.51.100.9               # ft-cloudflare\n",
 		testNumberedClean,
 	}
-	output, err := executeUFW(t, recorder, "only-cloudflare")
+	output, err := executeUFW(t, recorder, "cloudflare")
 	if err != nil {
 		t.Fatalf("Execute() error = %v\noutput:\n%s", err, output)
 	}
@@ -370,14 +539,14 @@ func TestUFWOnlyCloudflareDeletesConflictingRules(t *testing.T) {
 	}
 }
 
-func TestUFWOnlyCloudflareWarnsAboutKeptRules(t *testing.T) {
+func TestUFWCloudflareWarnsAboutKeptRules(t *testing.T) {
 	recorder := newUFWRecorder()
 	recorder.numbered = []string{
 		"Status: active\n" +
 			"[ 1] Anywhere                   ALLOW IN    10.8.0.5\n" +
 			"[ 2] 443                        DENY IN     203.0.113.9\n",
 	}
-	output, err := executeUFW(t, recorder, "only-cloudflare")
+	output, err := executeUFW(t, recorder, "cloudflare")
 	if err != nil {
 		t.Fatalf("Execute() error = %v\noutput:\n%s", err, output)
 	}
@@ -394,13 +563,13 @@ func TestUFWOnlyCloudflareWarnsAboutKeptRules(t *testing.T) {
 	}
 }
 
-func TestUFWOnlyCloudflareAppProfileResolutionFailure(t *testing.T) {
+func TestUFWCloudflareAppProfileResolutionFailure(t *testing.T) {
 	recorder := newUFWRecorder()
 	recorder.appInfoErr = errors.New("profile missing")
 	recorder.numbered = []string{
 		"Status: active\n[ 1] Mystery App                ALLOW IN    Anywhere\n",
 	}
-	_, err := executeUFW(t, recorder, "only-cloudflare")
+	_, err := executeUFW(t, recorder, "cloudflare")
 	if err == nil || !strings.Contains(err.Error(), "Mystery App") {
 		t.Fatalf("Execute() error = %v, want app profile failure", err)
 	}
@@ -409,22 +578,35 @@ func TestUFWOnlyCloudflareAppProfileResolutionFailure(t *testing.T) {
 	}
 }
 
-func TestUFWOnlyCloudflareRunFailureExplainsFailClosed(t *testing.T) {
+func TestUFWCloudflareRunFailureExplainsFailClosed(t *testing.T) {
 	recorder := newUFWRecorder()
 	recorder.runErrorAt = 2
 	recorder.runErr = errors.New("ufw exploded")
-	_, err := executeUFW(t, recorder, "only-cloudflare")
+	_, err := executeUFW(t, recorder, "cloudflare")
 	if err == nil || !strings.Contains(err.Error(), "may be blocked") {
 		t.Fatalf("Execute() error = %v, want fail-closed explanation", err)
 	}
 }
 
-func TestUFWOnlyCloudflareDeletionMustConverge(t *testing.T) {
+func TestUFWCloudflareCronRegistrationFailure(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.runErrorAt = len(testSortedRanges) + 1 // first cron step, right after the reload
+	recorder.runErr = errors.New("read-only filesystem")
+	_, err := executeUFW(t, recorder, "cloudflare")
+	if err == nil || !strings.Contains(err.Error(), "registering the hourly refresh") {
+		t.Fatalf("Execute() error = %v, want cron registration failure", err)
+	}
+	if strings.Contains(err.Error(), "may be blocked") {
+		t.Errorf("cron failure %v must not claim firewall inconsistency", err)
+	}
+}
+
+func TestUFWCloudflareDeletionMustConverge(t *testing.T) {
 	recorder := newUFWRecorder()
 	recorder.numbered = []string{
 		"Status: active\n[ 1] 80/tcp                     ALLOW IN    Anywhere\n",
 	}
-	_, err := executeUFW(t, recorder, "only-cloudflare")
+	_, err := executeUFW(t, recorder, "cloudflare")
 	if err == nil || !strings.Contains(err.Error(), "converge") {
 		t.Fatalf("Execute() error = %v, want convergence failure", err)
 	}
