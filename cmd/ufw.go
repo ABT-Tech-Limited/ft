@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math/rand/v2"
 	"os"
 	"strconv"
 	"strings"
@@ -49,7 +50,9 @@ type ufwDependencies struct {
 	output        func(context.Context, []string) ([]byte, error)
 	run           func(context.Context, []string, io.Reader) error
 	executable    func() (string, error)
-	fetch         cloudflarex.FetchFunc
+	// cronMinute returns the minute (1-59) for a fresh hourly cron entry.
+	cronMinute func() int
+	fetch      cloudflarex.FetchFunc
 }
 
 func newUFWCmd(deps ufwDependencies) *cobra.Command {
@@ -59,7 +62,39 @@ func newUFWCmd(deps ufwDependencies) *cobra.Command {
 		Args:  cobra.NoArgs,
 	}
 	ufwCmd.AddCommand(newUFWCloudflareCmd(deps))
+	ufwCmd.AddCommand(newUFWStatusCmd(deps))
+	ufwCmd.AddCommand(newUFWReloadCmd(deps))
 	return ufwCmd
+}
+
+// ensureUFWReady turns a missing or broken ufw package into an actionable
+// refusal shared by every rule-touching subcommand.
+func ensureUFWReady(statuses map[string]dpkgx.Status) error {
+	switch statuses["ufw"] {
+	case dpkgx.Installed:
+		return nil
+	case dpkgx.Broken:
+		return fmt.Errorf("ufw is in a broken package state; repair it, then retry")
+	default:
+		return fmt.Errorf(
+			"ufw is not installed; install it with \"sudo apt-get update && sudo apt-get install ufw\", " +
+				"allow your SSH port, enable the firewall, then re-run this command",
+		)
+	}
+}
+
+// readVerboseStatus reads and parses "ufw status verbose", returning the raw
+// output as well for callers that display it.
+func readVerboseStatus(ctx context.Context, deps ufwDependencies) (ufwx.VerboseStatus, string, error) {
+	verboseOutput, err := deps.output(ctx, []string{"ufw", "status", "verbose"})
+	if err != nil {
+		return ufwx.VerboseStatus{}, "", fmt.Errorf("reading ufw status failed: %w", err)
+	}
+	verbose, err := ufwx.ParseVerboseStatus(string(verboseOutput))
+	if err != nil {
+		return ufwx.VerboseStatus{}, "", fmt.Errorf("parsing ufw status failed: %w", err)
+	}
+	return verbose, string(verboseOutput), nil
 }
 
 func newUFWCloudflareCmd(deps ufwDependencies) *cobra.Command {
@@ -116,24 +151,13 @@ func runUFWCloudflare(cmd *cobra.Command, deps ufwDependencies) error {
 	if err != nil {
 		return fmt.Errorf("checking package status failed: %w", err)
 	}
-	switch statuses["ufw"] {
-	case dpkgx.Installed:
-	case dpkgx.Broken:
-		return fmt.Errorf("ufw is in a broken package state; repair it, then retry")
-	default:
-		return fmt.Errorf(
-			"ufw is not installed; install it with \"sudo apt-get update && sudo apt-get install ufw\", " +
-				"allow your SSH port, enable the firewall, then re-run this command",
-		)
+	if err := ensureUFWReady(statuses); err != nil {
+		return err
 	}
 
-	verboseOutput, err := deps.output(ctx, []string{"ufw", "status", "verbose"})
+	verbose, _, err := readVerboseStatus(ctx, deps)
 	if err != nil {
-		return fmt.Errorf("reading ufw status failed: %w", err)
-	}
-	verbose, err := ufwx.ParseVerboseStatus(string(verboseOutput))
-	if err != nil {
-		return fmt.Errorf("parsing ufw status failed: %w", err)
+		return err
 	}
 	if !verbose.Active {
 		return fmt.Errorf(
@@ -233,14 +257,21 @@ func runUFWCloudflare(cmd *cobra.Command, deps ufwDependencies) error {
 	return nil
 }
 
+// hasUFWDockerMarker probes after.rules with grep -s: quiet when the file is
+// missing (a plain "not set up"), non-zero exit when the marker is absent.
 func hasUFWDockerMarker(ctx context.Context, deps ufwDependencies) (bool, error) {
-	afterRules, err := deps.output(ctx, []string{"cat", afterRulesPath})
+	_, err := deps.output(ctx, []string{"grep", "-Fqs", "--", ufwDockerMarker, afterRulesPath})
+	return err == nil, nil
+}
+
+// managedCronLines returns the lines of the managed cron file that mention
+// this command, or "" when the file is missing or has no such line.
+func managedCronLines(ctx context.Context, deps ufwDependencies) string {
+	lines, err := deps.output(ctx, []string{"grep", "-Fhs", "--", "ufw cloudflare", cronFilePath})
 	if err != nil {
-		// A missing or unreadable after.rules simply means ufw-docker is not
-		// set up; the ufw package guard already ensured ufw itself exists.
-		return false, nil
+		return ""
 	}
-	return strings.Contains(string(afterRules), ufwDockerMarker), nil
+	return string(lines)
 }
 
 // installUFWDocker downloads the pinned ufw-docker script, verifies its
@@ -428,13 +459,19 @@ func registerCronRefresh(cmd *cobra.Command, deps ufwDependencies, cronStatus dp
 	}
 
 	fmt.Fprintln(out, "\n==> Registering hourly Cloudflare refresh in cron")
-	// Minute 17 avoids the top-of-hour thundering herd against Cloudflare's
-	// list endpoints without needing per-host randomness.
+	// A random minute (1-59, never the crowded top of the hour) spreads
+	// servers across the hour instead of hammering Cloudflare's endpoints
+	// together. Once registered the minute is reused, so the hourly self-run
+	// never reshuffles its own schedule.
+	minute := parseCronMinute(managedCronLines(ctx, deps))
+	if minute < 0 {
+		minute = deps.cronMinute()
+	}
 	content := fmt.Sprintf(
 		"# Managed by ft. Re-run \"ft ufw cloudflare\" to update, remove this file to stop.\n"+
 			"# Refreshes the Cloudflare allow rules for TCP ports %s every hour.\n"+
-			"17 * * * * root %q ufw cloudflare >> %s 2>&1\n",
-		cloudflarePortsSpec, executablePath, cronLogPath,
+			"%d * * * * root %q ufw cloudflare >> %s 2>&1\n",
+		cloudflarePortsSpec, minute, executablePath, cronLogPath,
 	)
 	steps := []struct {
 		argv  []string
@@ -460,8 +497,32 @@ func registerCronRefresh(cmd *cobra.Command, deps ufwDependencies, cronStatus dp
 			)
 		}
 	}
-	fmt.Fprintf(out, "Hourly refresh registered at %s (logs: %s).\n", cronFilePath, cronLogPath)
+	fmt.Fprintf(out, "Hourly refresh registered (minute %d) at %s (logs: %s).\n", minute, cronFilePath, cronLogPath)
 	return true, nil
+}
+
+// parseCronMinute extracts the minute of the managed hourly entry from cron
+// file content, or -1 when no valid entry exists.
+func parseCronMinute(content string) int {
+	for line := range strings.SplitSeq(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if !strings.Contains(trimmed, "ufw cloudflare") {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) < 6 || fields[1] != "*" {
+			continue
+		}
+		minute, err := strconv.Atoi(fields[0])
+		if err != nil || minute < 0 || minute > 59 {
+			continue
+		}
+		return minute
+	}
+	return -1
 }
 
 // runFirewallCommand wraps rule-changing failures with their fail-closed
@@ -484,6 +545,7 @@ func init() {
 		output:        sysx.OutputContext,
 		run:           sysx.RunInputContext,
 		executable:    os.Executable,
+		cronMinute:    func() int { return rand.IntN(59) + 1 },
 		fetch:         cloudflarex.Fetch,
 	}))
 }

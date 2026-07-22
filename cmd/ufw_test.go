@@ -22,9 +22,13 @@ const (
 
 	testNumberedClean = "Status: active\n\n     To                         Action      From\n     --                         ------      ----\n[ 1] 22/tcp                     ALLOW IN    Anywhere\n"
 
-	testUFWDockerMarker = "# BEGIN UFW AND DOCKER\n-A DOCKER-USER -j RETURN\n# END UFW AND DOCKER\n"
-
 	testExecutable = "/usr/local/bin/ft"
+
+	testCronMinute = 23
+
+	testCronFile = "# Managed by ft. Re-run \"ft ufw cloudflare\" to update, remove this file to stop.\n" +
+		"# Refreshes the Cloudflare allow rules for TCP ports 80,443 every hour.\n" +
+		"41 * * * * root \"/usr/local/bin/ft\" ufw cloudflare >> /var/log/ft-ufw-cloudflare.log 2>&1\n"
 )
 
 var testSortedRanges = []string{
@@ -49,7 +53,7 @@ const testNumberedInSync = "Status: active\n" +
 	"[ 7] 80,443/tcp (v6)            ALLOW IN    2400:cb00::/32             # ft-cloudflare\n" +
 	"[ 8] 80,443/tcp (v6)            ALLOW IN    2606:4700::/32             # ft-cloudflare\n"
 
-type afterRulesResponse struct {
+type textResponse struct {
 	content string
 	err     error
 }
@@ -59,10 +63,13 @@ type ufwRecorder struct {
 	detectErr       error
 	queryErr        error
 	queries         [][]string
-	verboseOutput   string
+	verbose         []string // consumed per status-verbose call; last entry repeats
+	verboseCalls    int
 	verboseErr      error
-	afterRules      []afterRulesResponse // consumed per cat call; last entry repeats
+	afterRules      []textResponse // consumed per cat call; last entry repeats
 	afterRulesCalls int
+	cronFile        textResponse
+	isEnabled       textResponse
 	numbered        []string // consumed per status-numbered call; last entry repeats
 	numberedCalls   int
 	appInfo         map[string]string
@@ -75,6 +82,8 @@ type ufwRecorder struct {
 	runErr          error
 	executablePath  string
 	executableErr   error
+	cronMinute      int
+	cronMinuteCalls int
 	v4              string
 	v6              string
 	v4Err           error
@@ -88,13 +97,18 @@ func newUFWRecorder() *ufwRecorder {
 			"ufw":  dpkgx.Installed,
 			"cron": dpkgx.Installed,
 		},
-		verboseOutput: testVerboseActive,
-		afterRules: []afterRulesResponse{
-			{err: errors.New("cat: /etc/ufw/after.rules: No such file or directory")},
+		verbose: []string{testVerboseActive},
+		// afterRules and cronFile model grep -s probes: a nil err means the
+		// marker/line was found; a non-nil err means absent (grep exit 1).
+		afterRules: []textResponse{
+			{err: errors.New("exit status 1")},
 		},
+		cronFile:       textResponse{err: errors.New("exit status 1")},
+		isEnabled:      textResponse{content: "enabled\n"},
 		numbered:       []string{testNumberedClean},
 		sha256Output:   "643e56b080567c567b4aa28650196849b2a2da5dd0473fd3e5216b0886035ab0  /usr/local/bin/ufw-docker.tmp\n",
 		executablePath: testExecutable,
+		cronMinute:     testCronMinute,
 		v4:             testCloudflareV4,
 		v6:             testCloudflareV6,
 		runErrorAt:     -1,
@@ -125,7 +139,15 @@ func (r *ufwRecorder) dependencies() ufwDependencies {
 			key := strings.Join(argv, " ")
 			switch {
 			case key == "ufw status verbose":
-				return []byte(r.verboseOutput), r.verboseErr
+				if r.verboseErr != nil {
+					return nil, r.verboseErr
+				}
+				index := r.verboseCalls
+				r.verboseCalls++
+				if index >= len(r.verbose) {
+					index = len(r.verbose) - 1
+				}
+				return []byte(r.verbose[index]), nil
 			case key == "ufw status numbered":
 				index := r.numberedCalls
 				r.numberedCalls++
@@ -133,7 +155,7 @@ func (r *ufwRecorder) dependencies() ufwDependencies {
 					index = len(r.numbered) - 1
 				}
 				return []byte(r.numbered[index]), nil
-			case key == "cat /etc/ufw/after.rules":
+			case key == "grep -Fqs -- BEGIN UFW AND DOCKER /etc/ufw/after.rules":
 				index := r.afterRulesCalls
 				r.afterRulesCalls++
 				if index >= len(r.afterRules) {
@@ -141,6 +163,10 @@ func (r *ufwRecorder) dependencies() ufwDependencies {
 				}
 				response := r.afterRules[index]
 				return []byte(response.content), response.err
+			case key == "grep -Fhs -- ufw cloudflare /etc/cron.d/ft-ufw-cloudflare":
+				return []byte(r.cronFile.content), r.cronFile.err
+			case key == "systemctl is-enabled ufw":
+				return []byte(r.isEnabled.content), r.isEnabled.err
 			case key == "sha256sum /usr/local/bin/ufw-docker.tmp":
 				return []byte(r.sha256Output), r.sha256Err
 			case len(argv) == 4 && key == "ufw app info "+argv[3]:
@@ -173,6 +199,10 @@ func (r *ufwRecorder) dependencies() ufwDependencies {
 		},
 		executable: func() (string, error) {
 			return r.executablePath, r.executableErr
+		},
+		cronMinute: func() int {
+			r.cronMinuteCalls++
+			return r.cronMinute
 		},
 		fetch: func(ctx context.Context, url string) ([]byte, error) {
 			r.fetchCalls = append(r.fetchCalls, url)
@@ -260,11 +290,14 @@ func TestUFWCloudflareHappyPathWithoutDocker(t *testing.T) {
 	assertCommands(t, recorder.commands, want)
 
 	cronContent := recorder.commands[len(recorder.commands)-2].input
-	if !strings.Contains(cronContent, `17 * * * * root "/usr/local/bin/ft" ufw cloudflare >> /var/log/ft-ufw-cloudflare.log 2>&1`) {
+	if !strings.Contains(cronContent, `23 * * * * root "/usr/local/bin/ft" ufw cloudflare >> /var/log/ft-ufw-cloudflare.log 2>&1`) {
 		t.Errorf("cron file content %q does not contain the hourly entry", cronContent)
 	}
 	if !strings.Contains(cronContent, "Managed by ft") {
 		t.Errorf("cron file content %q lacks the managed-by marker", cronContent)
+	}
+	if recorder.cronMinuteCalls != 1 {
+		t.Errorf("cronMinute called %d times, want 1", recorder.cronMinuteCalls)
 	}
 
 	if !strings.Contains(output, "5 IPv4 + 2 IPv6") {
@@ -278,9 +311,41 @@ func TestUFWCloudflareHappyPathWithoutDocker(t *testing.T) {
 	}
 }
 
+func TestUFWCloudflareKeepsExistingCronMinute(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.cronFile = textResponse{content: testCronFile}
+	_, err := executeUFW(t, recorder, "cloudflare")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	cronContent := recorder.commands[len(recorder.commands)-2].input
+	if !strings.Contains(cronContent, "41 * * * * root") {
+		t.Errorf("cron file content %q does not keep the existing minute 41", cronContent)
+	}
+	if recorder.cronMinuteCalls != 0 {
+		t.Errorf("cronMinute called %d times, want 0 when a valid entry exists", recorder.cronMinuteCalls)
+	}
+}
+
+func TestUFWCloudflarePicksFreshMinuteWhenCronFileUnparseable(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.cronFile = textResponse{content: "# stale garbage\nnot a cron line\n"}
+	_, err := executeUFW(t, recorder, "cloudflare")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	cronContent := recorder.commands[len(recorder.commands)-2].input
+	if !strings.Contains(cronContent, "23 * * * * root") {
+		t.Errorf("cron file content %q does not use the fresh minute", cronContent)
+	}
+	if recorder.cronMinuteCalls != 1 {
+		t.Errorf("cronMinute called %d times, want 1", recorder.cronMinuteCalls)
+	}
+}
+
 func TestUFWCloudflareAddsRouteRulesWithUFWDocker(t *testing.T) {
 	recorder := newUFWRecorder()
-	recorder.afterRules = []afterRulesResponse{{content: testUFWDockerMarker}}
+	recorder.afterRules = []textResponse{{}}
 	output, err := executeUFW(t, recorder, "cloudflare")
 	if err != nil {
 		t.Fatalf("Execute() error = %v\noutput:\n%s", err, output)
@@ -304,9 +369,9 @@ func TestUFWCloudflareInstallsUFWDockerWhenDockerPresent(t *testing.T) {
 		t.Run(pkg, func(t *testing.T) {
 			recorder := newUFWRecorder()
 			recorder.statuses[pkg] = dpkgx.Installed
-			recorder.afterRules = []afterRulesResponse{
-				{content: "# regular ufw after rules\n"},
-				{content: testUFWDockerMarker},
+			recorder.afterRules = []textResponse{
+				{err: errors.New("exit status 1")},
+				{},
 			}
 			output, err := executeUFW(t, recorder, "cloudflare")
 			if err != nil {
@@ -340,7 +405,7 @@ func TestUFWCloudflareInstallsUFWDockerWhenDockerPresent(t *testing.T) {
 func TestUFWCloudflareRejectsUFWDockerChecksumMismatch(t *testing.T) {
 	recorder := newUFWRecorder()
 	recorder.statuses["docker-ce"] = dpkgx.Installed
-	recorder.afterRules = []afterRulesResponse{{content: "# no marker\n"}}
+	recorder.afterRules = []textResponse{{err: errors.New("exit status 1")}}
 	recorder.sha256Output = "deadbeef  /usr/local/bin/ufw-docker.tmp\n"
 	_, err := executeUFW(t, recorder, "cloudflare")
 	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
@@ -356,7 +421,7 @@ func TestUFWCloudflareRejectsUFWDockerChecksumMismatch(t *testing.T) {
 func TestUFWCloudflareFailsWhenUFWDockerInstallLeavesNoMarker(t *testing.T) {
 	recorder := newUFWRecorder()
 	recorder.statuses["docker-ce"] = dpkgx.Installed
-	recorder.afterRules = []afterRulesResponse{{content: "# no marker\n"}}
+	recorder.afterRules = []textResponse{{err: errors.New("exit status 1")}}
 	_, err := executeUFW(t, recorder, "cloudflare")
 	if err == nil || !strings.Contains(err.Error(), "did not add") {
 		t.Fatalf("Execute() error = %v, want missing-marker failure", err)
@@ -382,7 +447,7 @@ func TestUFWCloudflareSkipsRebuildWhenRulesInSync(t *testing.T) {
 
 func TestUFWCloudflareRebuildsWhenRouteRulesMissing(t *testing.T) {
 	recorder := newUFWRecorder()
-	recorder.afterRules = []afterRulesResponse{{content: testUFWDockerMarker}}
+	recorder.afterRules = []textResponse{{}}
 	recorder.numbered = []string{testNumberedInSync, testNumberedClean}
 	_, err := executeUFW(t, recorder, "cloudflare")
 	if err != nil {
@@ -449,13 +514,13 @@ func TestUFWCloudflareGuards(t *testing.T) {
 		},
 		{
 			name:    "ufw inactive",
-			mutate:  func(r *ufwRecorder) { r.verboseOutput = "Status: inactive\n" },
+			mutate:  func(r *ufwRecorder) { r.verbose = []string{"Status: inactive\n"} },
 			wantErr: "inactive",
 		},
 		{
 			name: "default incoming allow",
 			mutate: func(r *ufwRecorder) {
-				r.verboseOutput = "Status: active\nDefault: allow (incoming), allow (outgoing), disabled (routed)\n"
+				r.verbose = []string{"Status: active\nDefault: allow (incoming), allow (outgoing), disabled (routed)\n"}
 			},
 			wantErr: "default deny incoming",
 		},
@@ -609,5 +674,178 @@ func TestUFWCloudflareDeletionMustConverge(t *testing.T) {
 	_, err := executeUFW(t, recorder, "cloudflare")
 	if err == nil || !strings.Contains(err.Error(), "converge") {
 		t.Fatalf("Execute() error = %v, want convergence failure", err)
+	}
+}
+
+func TestUFWStatusReportsEverything(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.afterRules = []textResponse{{}}
+	recorder.cronFile = textResponse{content: testCronFile}
+	recorder.numbered = []string{
+		"Status: active\n" +
+			"[ 1] 22/tcp                     ALLOW IN    Anywhere\n" +
+			"[ 2] 80,443/tcp                 ALLOW IN    103.21.244.0/22            # ft-cloudflare\n" +
+			"[ 3] 80,443/tcp                 ALLOW FWD   103.21.244.0/22            # ft-cloudflare\n",
+	}
+	output, err := executeUFW(t, recorder, "status")
+	if err != nil {
+		t.Fatalf("Execute() error = %v\noutput:\n%s", err, output)
+	}
+	for _, fragment := range []string{
+		"Status: active",
+		"Default: deny (incoming), allow (outgoing), disabled (routed)",
+		"Logging: on (low)",
+		"Startup at boot: enabled",
+		"ufw-docker: set up",
+		"registered (minute 41, /etc/cron.d/ft-ufw-cloudflare)",
+		"[ 1] 22/tcp",
+		"[ 3] 80,443/tcp",
+		"3 rules total",
+		"1 inbound + 1 routed",
+	} {
+		if !strings.Contains(output, fragment) {
+			t.Errorf("output does not contain %q:\n%s", fragment, output)
+		}
+	}
+	if len(recorder.commands) != 0 {
+		t.Errorf("status ran commands %v, want none (read-only)", recorder.commands)
+	}
+}
+
+func TestUFWStatusWhenNotInstalled(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.statuses["ufw"] = dpkgx.Absent
+	output, err := executeUFW(t, recorder, "status")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(output, "not installed") {
+		t.Errorf("output %q does not report the missing package", output)
+	}
+	if len(recorder.outputCalls) != 0 {
+		t.Errorf("queried system state %v despite missing ufw", recorder.outputCalls)
+	}
+}
+
+func TestUFWStatusWhenInactive(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.verbose = []string{"Status: inactive\n"}
+	output, err := executeUFW(t, recorder, "status")
+	if err != nil {
+		t.Fatalf("Execute() error = %v\noutput:\n%s", err, output)
+	}
+	if !strings.Contains(output, "inactive") {
+		t.Errorf("output %q does not report the inactive state", output)
+	}
+	if recorder.numberedCalls != 0 {
+		t.Errorf("queried numbered rules %d times, want 0 while inactive", recorder.numberedCalls)
+	}
+}
+
+func TestUFWStatusWithoutRules(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.numbered = []string{"Status: active\n"}
+	output, err := executeUFW(t, recorder, "status")
+	if err != nil {
+		t.Fatalf("Execute() error = %v\noutput:\n%s", err, output)
+	}
+	if !strings.Contains(output, "No rules defined.") {
+		t.Errorf("output %q does not report the empty rule set", output)
+	}
+	if !strings.Contains(output, "not registered") {
+		t.Errorf("output %q does not report the missing cron registration", output)
+	}
+	if !strings.Contains(output, "ufw-docker: not set up") {
+		t.Errorf("output %q does not report the missing ufw-docker setup", output)
+	}
+}
+
+func TestUFWStatusVerboseReadFailure(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.verboseErr = errors.New("permission denied")
+	_, err := executeUFW(t, recorder, "status")
+	if err == nil || !strings.Contains(err.Error(), "reading ufw status") {
+		t.Fatalf("Execute() error = %v, want status read failure", err)
+	}
+}
+
+func TestUFWReloadHappyPath(t *testing.T) {
+	recorder := newUFWRecorder()
+	output, err := executeUFW(t, recorder, "reload")
+	if err != nil {
+		t.Fatalf("Execute() error = %v\noutput:\n%s", err, output)
+	}
+	assertCommands(t, recorder.commands, [][]string{
+		{"ufw", "reload"},
+		{"systemctl", "restart", "ufw"},
+	})
+	if recorder.verboseCalls != 2 {
+		t.Errorf("read ufw status %d times, want 2 (guard + verify)", recorder.verboseCalls)
+	}
+	if !strings.Contains(output, "active") {
+		t.Errorf("output %q does not confirm the firewall is active", output)
+	}
+}
+
+func TestUFWReloadRefusesWhenInactive(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.verbose = []string{"Status: inactive\n"}
+	_, err := executeUFW(t, recorder, "reload")
+	if err == nil || !strings.Contains(err.Error(), "inactive") {
+		t.Fatalf("Execute() error = %v, want inactive refusal", err)
+	}
+	if len(recorder.commands) != 0 {
+		t.Errorf("ran commands %v, want none", recorder.commands)
+	}
+}
+
+func TestUFWReloadGuards(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*ufwRecorder)
+		wantErr string
+	}{
+		{
+			name:    "ufw not installed",
+			mutate:  func(r *ufwRecorder) { r.statuses["ufw"] = dpkgx.Absent },
+			wantErr: "ufw is not installed",
+		},
+		{
+			name:    "ufw broken",
+			mutate:  func(r *ufwRecorder) { r.statuses["ufw"] = dpkgx.Broken },
+			wantErr: "broken",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := newUFWRecorder()
+			tt.mutate(recorder)
+			_, err := executeUFW(t, recorder, "reload")
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Execute() error = %v, want it to contain %q", err, tt.wantErr)
+			}
+			if len(recorder.commands) != 0 {
+				t.Errorf("ran commands %v, want none", recorder.commands)
+			}
+		})
+	}
+}
+
+func TestUFWReloadFailsWhenInactiveAfterRestart(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.verbose = []string{testVerboseActive, "Status: inactive\n"}
+	_, err := executeUFW(t, recorder, "reload")
+	if err == nil || !strings.Contains(err.Error(), "no longer active") {
+		t.Fatalf("Execute() error = %v, want inactive-after-restart failure", err)
+	}
+}
+
+func TestUFWReloadRunFailure(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.runErrorAt = 0
+	recorder.runErr = errors.New("iptables locked")
+	_, err := executeUFW(t, recorder, "reload")
+	if err == nil || !strings.Contains(err.Error(), "ufw reload") {
+		t.Fatalf("Execute() error = %v, want reload failure", err)
 	}
 }
