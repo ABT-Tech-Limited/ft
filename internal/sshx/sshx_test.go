@@ -11,12 +11,12 @@ import (
 func TestEffectivePortsRunsOpenSSHEffectiveConfig(t *testing.T) {
 	type contextKey string
 	ctx := context.WithValue(context.Background(), contextKey("test"), "value")
-	var gotContext context.Context
-	var gotArgv []string
+	var gotContexts []context.Context
+	var gotArgvs [][]string
 
 	ports, err := EffectivePorts(ctx, func(callContext context.Context, argv []string) ([]byte, error) {
-		gotContext = callContext
-		gotArgv = append([]string(nil), argv...)
+		gotContexts = append(gotContexts, callContext)
+		gotArgvs = append(gotArgvs, append([]string(nil), argv...))
 		return []byte("port 10222\n"), nil
 	})
 	if err != nil {
@@ -25,17 +25,47 @@ func TestEffectivePortsRunsOpenSSHEffectiveConfig(t *testing.T) {
 	if !reflect.DeepEqual(ports, []int{10222}) {
 		t.Errorf("EffectivePorts() = %v, want [10222]", ports)
 	}
-	if gotContext != ctx {
-		t.Errorf("EffectivePorts() context = %v, want original context", gotContext)
+	want := [][]string{
+		{"install", "-m", "0755", "-d", "/run/sshd"},
+		{"/usr/sbin/sshd", "-T"},
 	}
-	if want := []string{"/usr/sbin/sshd", "-T"}; !reflect.DeepEqual(gotArgv, want) {
-		t.Errorf("EffectivePorts() argv = %v, want %v", gotArgv, want)
+	if !reflect.DeepEqual(gotArgvs, want) {
+		t.Errorf("EffectivePorts() commands = %v, want %v", gotArgvs, want)
+	}
+	for i, gotContext := range gotContexts {
+		if gotContext != ctx {
+			t.Errorf("EffectivePorts() command %d context = %v, want original context", i, gotContext)
+		}
+	}
+}
+
+func TestEffectivePortsWrapsPrivsepDirectoryFailure(t *testing.T) {
+	wantErr := errors.New("install failed")
+	var calls [][]string
+	ports, err := EffectivePorts(context.Background(), func(_ context.Context, argv []string) ([]byte, error) {
+		calls = append(calls, append([]string(nil), argv...))
+		return nil, wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("EffectivePorts() error = %v, want errors.Is(_, wantErr)", err)
+	}
+	if !strings.Contains(err.Error(), "privilege separation directory /run/sshd") {
+		t.Errorf("EffectivePorts() error = %q, want privilege separation directory context", err)
+	}
+	if len(calls) != 1 {
+		t.Errorf("EffectivePorts() ran commands %v, want only the directory command", calls)
+	}
+	if ports != nil {
+		t.Errorf("EffectivePorts() ports = %v, want nil", ports)
 	}
 }
 
 func TestEffectivePortsWrapsCommandFailure(t *testing.T) {
 	wantErr := errors.New("sshd test failed")
-	ports, err := EffectivePorts(context.Background(), func(context.Context, []string) ([]byte, error) {
+	ports, err := EffectivePorts(context.Background(), func(_ context.Context, argv []string) ([]byte, error) {
+		if argv[0] != "/usr/sbin/sshd" {
+			return nil, nil
+		}
 		return nil, wantErr
 	})
 	if !errors.Is(err, wantErr) {

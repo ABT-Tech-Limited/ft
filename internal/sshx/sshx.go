@@ -12,11 +12,22 @@ import (
 // OutputFunc runs argv and returns its standard output.
 type OutputFunc func(context.Context, []string) ([]byte, error)
 
+// privsepDir is Debian/Ubuntu's sshd privilege separation directory. sshd
+// refuses to run — even in the -t/-T configuration check modes — while it is
+// missing, and it lives on the /run tmpfs, so it is absent whenever
+// ssh.service is not running (systemd's RuntimeDirectory= removes it on
+// stop). Recreate it with the same 0755 root directory that ssh.service and
+// Debian's check_privsep_dir use before consulting sshd.
+const privsepDir = "/run/sshd"
+
 // EffectivePorts asks OpenSSH to expand its server configuration and returns
 // every configured listening port in declaration order.
 func EffectivePorts(ctx context.Context, output OutputFunc) ([]int, error) {
 	if output == nil {
 		return nil, fmt.Errorf("nil SSH command output runner")
+	}
+	if _, err := output(ctx, []string{"install", "-m", "0755", "-d", privsepDir}); err != nil {
+		return nil, fmt.Errorf("creating SSH privilege separation directory %s: %w", privsepDir, err)
 	}
 	data, err := output(ctx, []string{"/usr/sbin/sshd", "-T"})
 	if err != nil {
