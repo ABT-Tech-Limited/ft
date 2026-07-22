@@ -63,6 +63,7 @@ ft install nginx       # 安装并启动 Nginx
 ft install fail2ban    # 安装并启动 Fail2Ban SSH 防护
 ft ssh port            # 查看当前生效的 SSH 端口
 ft ssh port 10222      # 修改 SSH 端口（校验后重启，自动同步 fail2ban，检测 ufw）
+ft ufw only-cloudflare # 仅允许 Cloudflare IP 访问 80/443（Docker 场景要求 ufw-docker）
 ft update              # 更新到最新稳定版
 ft version             # 查看版本
 ft --help              # 查看全部命令
@@ -190,6 +191,29 @@ ft ssh port 10222
 - 改完后请保持当前会话，先在新终端用 `ssh -p <端口> user@host` 验证连通再退出。
 
 不带参数运行 `ft ssh port` 可查看当前生效端口。
+
+### 仅允许 Cloudflare 访问 80/443
+
+```bash
+ft ufw only-cloudflare
+```
+
+拉取 Cloudflare 官方 IP 段（`https://www.cloudflare.com/ips-v4` 与 `ips-v6`），把 TCP 80/443 收紧为仅 Cloudflare 可访问：
+
+1. 删除其他放行 80/443 的 ufw 规则（含 `Nginx Full` 等应用配置规则，逐条打印可审计）；
+2. 为每个 Cloudflare 段添加 `ufw allow proto tcp from <段> to any port 80,443`，并用注释 `ft-cloudflare` 标记为 ft 托管；
+3. `ufw reload` 生效。
+
+重复执行即刷新：托管规则按最新列表整体重建。Cloudflare 会不定期调整 IP 段，建议定期重跑本命令。
+
+执行前置条件（任一不满足都会明确报错退出，防火墙零改动）：
+
+- ufw 已安装且 active。ft 不会代跑 `sudo ufw enable`——请先自行放行 SSH 端口再启用防火墙。
+- 默认入站策略为 deny/reject，否则其他 IP 依旧能进；可先执行 `sudo ufw default deny incoming`（确认 SSH 端口已放行）。
+- 已安装 Docker 时必须先安装 [ufw-docker](https://github.com/chaifeng/ufw-docker)：Docker 发布端口直接走 iptables、绕过 ufw 的 INPUT 链，普通 ufw 规则拦不住 Docker 端口。检测到 ufw-docker 后，ft 会同时添加 `ufw route allow` 规则，把 Docker 发布的 80/443 一并收紧；未安装则拒绝执行，避免制造「已受保护」的假象。
+- Cloudflare 列表拉取或校验失败（数量异常、混入非法条目等）时立即中止。
+
+放行全部端口的规则（如管理 IP 白名单）与可能挡住 Cloudflare 的 DENY/REJECT 规则不会被删除，但会在收尾时提示人工复查。SSH 及其他端口的规则一律不动。云安全组等 ufw 之外的防火墙不在管理范围，需自行确认放行 Cloudflare。
 
 ## 更新 ft
 
