@@ -20,6 +20,7 @@ ft init                # 初始化系统：apt 更新升级 + 安装常用工具
 ft install docker      # 安装并启动 Docker Engine（官方 apt 源）
 ft install nginx       # 安装并启动 Nginx
 ft install fail2ban    # 安装并启动 Fail2Ban SSH 防护（自动同步 SSH 端口）
+ft install codex       # 安装/更新 Codex CLI，配置并验证自定义 API
 ft ssh port            # 查看当前生效的 SSH 端口
 ft ssh port 10222      # 修改 SSH 端口（校验后重启，自动同步 fail2ban，检测 ufw）
 ft ufw cloudflare      # 仅允许 Cloudflare IP 访问 80/443，自动注册每小时刷新
@@ -33,7 +34,7 @@ ft --help              # 查看全部命令
 详细说明：
 
 - [ft init — 系统初始化](docs/init.md)
-- [ft install / ft update — 软件安装与更新](docs/install.md)（Docker、Nginx、Fail2Ban、自更新）
+- [ft install / ft update — 软件安装与更新](docs/install.md)（Docker、Nginx、Fail2Ban、Codex、自更新）
 - [ft ssh — SSH 端口管理](docs/ssh.md)
 - [ft ufw — 防火墙管理](docs/ufw.md)（Cloudflare 白名单、状态、重载）
 

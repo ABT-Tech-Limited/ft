@@ -16,6 +16,7 @@ internal/osrelease/   # /etc/os-release 解析与支持性判断
 internal/aptx/        # apt-get 命令构建与兼容执行接口
 internal/dpkgx/       # dpkg 包安装状态查询
 internal/installer/   # Docker/Nginx/Fail2Ban 安装步骤构建
+internal/codexx/      # Codex 官方安装、用户配置、凭据登录与运行验证
 internal/sshx/        # OpenSSH 有效端口检测与解析
 internal/sysx/        # context-aware 特权命令执行
 internal/updater/     # GitHub Release 检查、校验与原子自更新

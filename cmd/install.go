@@ -32,7 +32,7 @@ func newInstallCmd(deps installDependencies) *cobra.Command {
 		Long: `Install server software using supported, auditable package sources.
 
 Currently available: Docker Engine from Docker's official apt repository,
-plus Nginx and Fail2Ban from Ubuntu's apt repositories.`,
+plus Nginx and Fail2Ban from Ubuntu's apt repositories, and OpenAI Codex CLI.`,
 		Args: cobra.NoArgs,
 	}
 	var fail2banSSHPort int
@@ -87,6 +87,7 @@ firewall settings, or other Fail2Ban configuration files.`,
 	)
 
 	installCmd.AddCommand(
+		newInstallCodexCmd(productionCodexInstallDependencies()),
 		&cobra.Command{
 			Use:   "docker",
 			Short: "Install Docker Engine, Buildx and Compose",
