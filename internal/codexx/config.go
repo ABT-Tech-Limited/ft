@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	Model             = "gpt-5.6-sol"
+	Model             = "gpt-6-astra"
 	ModelProvider     = "custom"
 	ReasoningEffort   = "ultra"
 	ModelContext      = int64(1_000_000)

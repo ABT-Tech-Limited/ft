@@ -83,7 +83,7 @@ func TestManagedConfigMatches(t *testing.T) {
 	const host = "https://gateway.example.com/v1"
 	valid := `
 model_provider = "custom"
-model = "gpt-5.6-sol"
+model = "gpt-6-astra"
 model_reasoning_effort = "ultra"
 model_context_window = 1_000_000
 model_auto_compact_token_limit = 800000
@@ -103,7 +103,7 @@ requires_openai_auth = true
 	}{
 		{name: "exact fields", input: valid, host: host, want: true},
 		{name: "unmanaged fields allowed", input: valid + "\n[history]\npersistence = \"save-all\"\n", host: host, want: true},
-		{name: "wrong model", input: strings.Replace(valid, "gpt-5.6-sol", "gpt-5.5", 1), host: host},
+		{name: "wrong model", input: strings.Replace(valid, "gpt-6-astra", "gpt-5.5", 1), host: host},
 		{name: "wrong host", input: valid, host: "https://other.example.com/v1"},
 		{name: "wrong integer type", input: strings.Replace(valid, "800000", `"800000"`, 1), host: host},
 		{name: "syntax error", input: `model = "unterminated`, host: host, wantErr: ErrInvalidConfig},

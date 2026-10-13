@@ -122,7 +122,7 @@ func TestInstallCodexUpdatesExistingVersionAndRepairsConfiguration(t *testing.T)
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	for _, want := range []string{"0.150.0", "0.151.0", "gpt-5.6-sol", "ultra", "1000000", "800000", "https://gateway.example.com/v1", codexx.MaskAPIKey(secret), "配置正确，可以使用"} {
+	for _, want := range []string{"0.150.0", "0.151.0", "gpt-6-astra", "ultra", "1000000", "800000", "https://gateway.example.com/v1", codexx.MaskAPIKey(secret), "配置正确，可以使用"} {
 		if !strings.Contains(output, want) {
 			t.Errorf("output %q does not contain %q", output, want)
 		}
