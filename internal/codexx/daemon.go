@@ -2,6 +2,7 @@ package codexx
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -33,4 +34,89 @@ func StopDaemon(ctx context.Context, runner Runner, executable string, stdout, s
 		return fmt.Errorf("stop Codex app-server daemon: %w", err)
 	}
 	return nil
+}
+
+// DaemonUpdateStatus reports what "codex app-server daemon update" did.
+type DaemonUpdateStatus string
+
+const (
+	// DaemonUpdated reports that the daemon package was installed or refreshed.
+	DaemonUpdated DaemonUpdateStatus = "updated"
+	// DaemonNoUpdate reports that the daemon package is already current.
+	DaemonNoUpdate DaemonUpdateStatus = "noUpdate"
+	// DaemonUnsupported reports that no managed daemon package is selected yet,
+	// which happens before the first codex launch in a CODEX_HOME.
+	DaemonUnsupported DaemonUpdateStatus = "unsupported"
+)
+
+// DaemonUpdate holds the result of a daemon package update.
+type DaemonUpdate struct {
+	Status           DaemonUpdateStatus
+	InstalledVersion string
+	RunningVersion   string
+	Message          string
+}
+
+type daemonUpdateOutput struct {
+	Status           string `json:"status"`
+	InstalledVersion string `json:"installedVersion"`
+	RunningVersion   string `json:"runningVersion"`
+	Message          string `json:"message"`
+}
+
+// UpdateDaemon brings the shared app-server daemon package to the latest
+// release. The daemon keeps its own package copy, which the official installer
+// and a plain daemon restart do not refresh. Command diagnostics are passed to
+// stderr; the single JSON result line is returned as a parsed DaemonUpdate.
+func UpdateDaemon(ctx context.Context, runner Runner, executable string, stderr io.Writer) (DaemonUpdate, error) {
+	if ctx == nil {
+		return DaemonUpdate{}, fmt.Errorf("nil daemon update context")
+	}
+	if runner == nil {
+		return DaemonUpdate{}, fmt.Errorf("nil command runner")
+	}
+	if strings.TrimSpace(executable) == "" {
+		return DaemonUpdate{}, fmt.Errorf("empty Codex executable")
+	}
+
+	var output strings.Builder
+	err := runner.Run(ctx, Command{
+		Path:   executable,
+		Args:   []string{"app-server", "daemon", "update"},
+		Stdout: &output,
+		Stderr: stderr,
+	})
+	if err != nil {
+		return DaemonUpdate{}, fmt.Errorf("update Codex app-server daemon: %w", err)
+	}
+	return parseDaemonUpdate(output.String())
+}
+
+func parseDaemonUpdate(output string) (DaemonUpdate, error) {
+	lines := strings.Split(output, "\n")
+	lastLine := ""
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			lastLine = line
+		}
+	}
+	if lastLine == "" {
+		return DaemonUpdate{}, fmt.Errorf("Codex app-server daemon update reported no status")
+	}
+	var parsed daemonUpdateOutput
+	if err := json.Unmarshal([]byte(lastLine), &parsed); err != nil {
+		return DaemonUpdate{}, fmt.Errorf("parse Codex app-server daemon update output: %w", err)
+	}
+	status := DaemonUpdateStatus(parsed.Status)
+	switch status {
+	case DaemonUpdated, DaemonNoUpdate, DaemonUnsupported:
+	default:
+		return DaemonUpdate{}, fmt.Errorf("Codex app-server daemon update reported unexpected status %q", parsed.Status)
+	}
+	return DaemonUpdate{
+		Status:           status,
+		InstalledVersion: parsed.InstalledVersion,
+		RunningVersion:   parsed.RunningVersion,
+		Message:          parsed.Message,
+	}, nil
 }

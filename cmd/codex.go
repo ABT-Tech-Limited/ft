@@ -9,13 +9,15 @@ import (
 func newCodexCmd(deps codexDependencies) *cobra.Command {
 	codexCmd := &cobra.Command{
 		Use:   "codex",
-		Short: "Manage OpenAI Codex CLI configuration",
-		Long: `Manage the user-level OpenAI Codex CLI configuration.
+		Short: "Manage the OpenAI Codex CLI installation and configuration",
+		Long: `Manage the user-level OpenAI Codex CLI installation and configuration.
 
-Use "ft install codex" to install or update Codex itself.`,
+Use "ft install codex" for first-time setup, "ft codex update" to move to the
+latest release, and "ft codex config" to change the API host or key.`,
 		Args: cobra.NoArgs,
 	}
 	codexCmd.AddCommand(newCodexConfigCmd(deps))
+	codexCmd.AddCommand(newCodexUpdateCmd(deps))
 	return codexCmd
 }
 

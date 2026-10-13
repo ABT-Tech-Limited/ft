@@ -21,6 +21,7 @@ type codexRecorder struct {
 	writeCalls        int
 	loginCalls        int
 	stopDaemonCalls   int
+	updateDaemonCalls int
 	validateCalls     int
 	validateErrors    []error
 	config            []byte
@@ -33,6 +34,9 @@ type codexRecorder struct {
 	writeErr          error
 	loginErr          error
 	stopDaemonErr     error
+	updateDaemonErr   error
+	detectErr         error
+	daemonUpdate      codexx.DaemonUpdate
 }
 
 func (r *codexRecorder) dependencies() codexDependencies {
@@ -48,6 +52,9 @@ func (r *codexRecorder) dependencies() codexDependencies {
 		detectVersion: func(ctx context.Context, _ string) (string, error) {
 			r.contexts = append(r.contexts, ctx)
 			r.detectCalls++
+			if r.detectErr != nil {
+				return "", r.detectErr
+			}
 			if r.detectCalls == 1 {
 				if r.versionBefore == "" {
 					return "", codexx.ErrNotFound
@@ -62,6 +69,7 @@ func (r *codexRecorder) dependencies() codexDependencies {
 		install: func(ctx context.Context, _, _ io.Writer) error {
 			r.contexts = append(r.contexts, ctx)
 			r.installCalls++
+			r.events = append(r.events, "install")
 			return r.installErr
 		},
 		configPath:    func() (string, error) { return "/home/test/.codex/config.toml", nil },
@@ -95,6 +103,18 @@ func (r *codexRecorder) dependencies() codexDependencies {
 			r.events = append(r.events, "stopDaemon")
 			return r.stopDaemonErr
 		},
+		updateDaemon: func(ctx context.Context, _ string, _ io.Writer) (codexx.DaemonUpdate, error) {
+			r.contexts = append(r.contexts, ctx)
+			r.updateDaemonCalls++
+			r.events = append(r.events, "updateDaemon")
+			if r.updateDaemonErr != nil {
+				return codexx.DaemonUpdate{}, r.updateDaemonErr
+			}
+			if r.daemonUpdate.Status == "" {
+				return codexx.DaemonUpdate{Status: codexx.DaemonNoUpdate, InstalledVersion: "0.151.0"}, nil
+			}
+			return r.daemonUpdate, nil
+		},
 		validate: func(ctx context.Context, _ string, _, _ io.Writer) error {
 			r.contexts = append(r.contexts, ctx)
 			r.validateCalls++
@@ -127,8 +147,12 @@ func TestInstallCodexInstallsLatestAndAcceptsValidConfiguration(t *testing.T) {
 	if recorder.writeCalls != 0 || recorder.loginCalls != 0 || recorder.stopDaemonCalls != 0 {
 		t.Errorf("valid setup changed state: write=%d login=%d stopDaemon=%d", recorder.writeCalls, recorder.loginCalls, recorder.stopDaemonCalls)
 	}
-	if recorder.installCalls != 1 {
-		t.Errorf("install calls = %d, want 1", recorder.installCalls)
+	want := []string{"install", "updateDaemon", "validate"}
+	if !reflect.DeepEqual(recorder.events, want) {
+		t.Errorf("events = %v, want %v", recorder.events, want)
+	}
+	if recorder.updateDaemonCalls != 1 {
+		t.Errorf("updateDaemon calls = %d, want 1", recorder.updateDaemonCalls)
 	}
 }
 
@@ -155,7 +179,7 @@ func TestInstallCodexUpdatesExistingVersionAndRepairsConfiguration(t *testing.T)
 	if recorder.writtenHost != "https://gateway.example.com/v1" || recorder.loginKey != secret {
 		t.Errorf("written host/key = %q/%q", recorder.writtenHost, recorder.loginKey)
 	}
-	want := []string{"validate", "write", "login", "stopDaemon", "validate"}
+	want := []string{"install", "updateDaemon", "validate", "write", "login", "stopDaemon", "validate"}
 	if !reflect.DeepEqual(recorder.events, want) {
 		t.Errorf("events = %v, want %v", recorder.events, want)
 	}
@@ -204,6 +228,7 @@ func TestInstallCodexStopsOnFailuresWithoutReadyMessage(t *testing.T) {
 		wantValidates int
 	}{
 		{name: "installer", recorder: &codexRecorder{installErr: errors.New("download failed")}},
+		{name: "daemon update", recorder: &codexRecorder{updateDaemonErr: errors.New("daemon update failed")}},
 		{name: "login", recorder: &codexRecorder{validateErrors: []error{errors.New("bad")}, loginErr: errors.New("login failed")}, input: repairInput, wantValidates: 1},
 		{name: "daemon stop", recorder: &codexRecorder{validateErrors: []error{errors.New("bad")}, stopDaemonErr: errors.New("daemon stop failed")}, input: repairInput, wantValidates: 1},
 		{name: "post validation", recorder: &codexRecorder{validateErrors: []error{errors.New("bad"), errors.New("still bad")}}, input: repairInput, wantValidates: 2},
@@ -234,6 +259,22 @@ func TestInstallCodexExplainsDaemonStopFailure(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not contain %q", err, want)
 		}
+	}
+}
+
+func TestInstallCodexExplainsDaemonUpdateFailure(t *testing.T) {
+	recorder := &codexRecorder{updateDaemonErr: errors.New("offline")}
+	output, err := executeInstallCodex(t, context.Background(), recorder, "")
+	if err == nil {
+		t.Fatal("Execute() error = nil")
+	}
+	for _, want := range []string{"offline", "codex app-server daemon update"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+	if !strings.Contains(output, "0.151.0 is installed") {
+		t.Errorf("output %q does not report the installed CLI version", output)
 	}
 }
 

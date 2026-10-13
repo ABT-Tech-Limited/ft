@@ -30,6 +30,7 @@ type codexDependencies struct {
 	writeConfig      func(context.Context, string, []byte, []byte, []byte) (string, error)
 	login            func(context.Context, string, string, io.Writer, io.Writer) error
 	stopDaemon       func(context.Context, string, io.Writer, io.Writer) error
+	updateDaemon     func(context.Context, string, io.Writer) (codexx.DaemonUpdate, error)
 	validate         func(context.Context, string, io.Writer, io.Writer) error
 	readSecret       func(io.Reader, io.Writer) (string, error)
 }
@@ -43,9 +44,10 @@ func newInstallCodexCmd(deps codexDependencies) *cobra.Command {
 After installation, ft verifies the active configuration with a minimal model
 request. If repair is needed, it asks for a Responses API host and API key,
 shows a masked preview, preserves unrelated config.toml settings, stores the
-credential through "codex login", stops the shared app-server daemon so the
-next codex launch loads the new settings, and validates the result. Run without
-sudo. To change the host or key later, run "ft codex config".`,
+credential through "codex login", updates the shared app-server daemon package,
+stops that daemon so the next codex launch loads the new settings, and
+validates the result. Run without sudo. To change the host or key later, run
+"ft codex config"; to only update the CLI, run "ft codex update".`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runInstallCodex(cmd, deps)
@@ -74,22 +76,9 @@ func runInstallCodex(cmd *cobra.Command, deps codexDependencies) error {
 	} else {
 		fmt.Fprintf(out, "Detected Codex CLI %s; checking for the latest release...\n", before)
 	}
-	if err := deps.install(cmd.Context(), out, errOut); err != nil {
-		return fmt.Errorf("installing or updating Codex CLI: %w", err)
-	}
-
-	executable, err := deps.resolveInstalled()
+	executable, err := updateCodexCLI(cmd, deps, out, errOut, before, "installed")
 	if err != nil {
-		return fmt.Errorf("locating Codex after installation: %w", err)
-	}
-	after, err := deps.detectVersion(cmd.Context(), executable)
-	if err != nil {
-		return fmt.Errorf("checking installed Codex version after installation: %w", err)
-	}
-	if before != "" && before != after {
-		fmt.Fprintf(out, "Updated Codex CLI from %s to %s.\n", before, after)
-	} else {
-		fmt.Fprintf(out, "Codex CLI %s is installed.\n", after)
+		return err
 	}
 
 	configPath, err := deps.configPath()
@@ -161,6 +150,55 @@ func configureCodex(cmd *cobra.Command, deps codexDependencies, executable, conf
 	}
 	fmt.Fprintln(out, "Codex 配置正确，可以使用。")
 	return nil
+}
+
+// updateCodexCLI runs the official installer, reports the version change with
+// action describing the fallback case ("installed" or "already the latest
+// release"), and refreshes the shared app-server daemon package so it does not
+// keep serving an older release. It returns the installed Codex executable.
+func updateCodexCLI(cmd *cobra.Command, deps codexDependencies, out, errOut io.Writer, before, action string) (string, error) {
+	if err := deps.install(cmd.Context(), out, errOut); err != nil {
+		return "", fmt.Errorf("installing or updating Codex CLI: %w", err)
+	}
+	executable, err := deps.resolveInstalled()
+	if err != nil {
+		return "", fmt.Errorf("locating Codex after installation: %w", err)
+	}
+	after, err := deps.detectVersion(cmd.Context(), executable)
+	if err != nil {
+		return "", fmt.Errorf("checking installed Codex version after installation: %w", err)
+	}
+	if before != "" && before != after {
+		fmt.Fprintf(out, "Updated Codex CLI from %s to %s.\n", before, after)
+	} else if before == "" {
+		fmt.Fprintf(out, "Codex CLI %s is installed.\n", after)
+	} else {
+		fmt.Fprintf(out, "Codex CLI %s is %s.\n", after, action)
+	}
+	fmt.Fprintln(out, "Refreshing the shared Codex app-server...")
+	update, err := deps.updateDaemon(cmd.Context(), executable, errOut)
+	if err != nil {
+		return "", fmt.Errorf("Codex CLI was updated but the shared app-server could not be refreshed: %w; run \"codex app-server daemon update\" manually", err)
+	}
+	fmt.Fprintln(out, describeDaemonUpdate(update))
+	return executable, nil
+}
+
+func describeDaemonUpdate(update codexx.DaemonUpdate) string {
+	switch update.Status {
+	case codexx.DaemonUpdated:
+		if update.RunningVersion == "" {
+			return fmt.Sprintf("共享 Codex app-server 已更新到 %s；下次启动 codex 时使用新版本。", update.InstalledVersion)
+		}
+		return fmt.Sprintf("共享 Codex app-server 已更新到 %s 并已重启。", update.RunningVersion)
+	case codexx.DaemonNoUpdate:
+		if update.RunningVersion == "" {
+			return fmt.Sprintf("共享 Codex app-server 已是 %s。", update.InstalledVersion)
+		}
+		return fmt.Sprintf("共享 Codex app-server 已是 %s 且未重启。", update.RunningVersion)
+	default:
+		return "共享 Codex app-server 尚未启动；下次启动 codex 时会使用最新版本。"
+	}
 }
 
 func promptHost(input io.Reader, output io.Writer) (string, error) {
@@ -292,6 +330,9 @@ func productionCodexDependencies() codexDependencies {
 		},
 		stopDaemon: func(ctx context.Context, executable string, stdout, stderr io.Writer) error {
 			return codexx.StopDaemon(ctx, runner, executable, stdout, stderr)
+		},
+		updateDaemon: func(ctx context.Context, executable string, stderr io.Writer) (codexx.DaemonUpdate, error) {
+			return codexx.UpdateDaemon(ctx, runner, executable, stderr)
 		},
 		validate: func(ctx context.Context, executable string, stdout, stderr io.Writer) error {
 			return codexx.Validate(ctx, runner, executable, stdout, stderr)
