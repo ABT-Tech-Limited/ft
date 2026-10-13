@@ -5,35 +5,45 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/ABT-Tech-Limited/ft/internal/codexx"
 )
 
-type codexInstallRecorder struct {
-	versionBefore  string
-	versionAfter   string
-	detectCalls    int
-	installCalls   int
-	readCalls      int
-	writeCalls     int
-	loginCalls     int
-	validateCalls  int
-	validateErrors []error
-	config         []byte
-	writtenHost    string
-	loginKey       string
-	contexts       []context.Context
-	installErr     error
-	writeErr       error
-	loginErr       error
+type codexRecorder struct {
+	versionBefore     string
+	versionAfter      string
+	detectCalls       int
+	installCalls      int
+	readCalls         int
+	writeCalls        int
+	loginCalls        int
+	stopDaemonCalls   int
+	validateCalls     int
+	validateErrors    []error
+	config            []byte
+	writtenHost       string
+	loginKey          string
+	events            []string
+	contexts          []context.Context
+	resolveCurrentErr error
+	installErr        error
+	writeErr          error
+	loginErr          error
+	stopDaemonErr     error
 }
 
-func (r *codexInstallRecorder) dependencies() codexInstallDependencies {
-	return codexInstallDependencies{
-		isSudo:           func() bool { return false },
-		resolveCurrent:   func() (string, error) { return "/usr/bin/codex", nil },
+func (r *codexRecorder) dependencies() codexDependencies {
+	return codexDependencies{
+		isSudo: func() bool { return false },
+		resolveCurrent: func() (string, error) {
+			if r.resolveCurrentErr != nil {
+				return "", r.resolveCurrentErr
+			}
+			return "/usr/bin/codex", nil
+		},
 		resolveInstalled: func() (string, error) { return "/home/test/.local/bin/codex", nil },
 		detectVersion: func(ctx context.Context, _ string) (string, error) {
 			r.contexts = append(r.contexts, ctx)
@@ -64,6 +74,7 @@ func (r *codexInstallRecorder) dependencies() codexInstallDependencies {
 		writeConfig: func(ctx context.Context, _ string, _ []byte, prepared []byte, _ []byte) (string, error) {
 			r.contexts = append(r.contexts, ctx)
 			r.writeCalls++
+			r.events = append(r.events, "write")
 			for _, line := range strings.Split(string(prepared), "\n") {
 				if strings.HasPrefix(line, "base_url = ") {
 					r.writtenHost = strings.Trim(strings.TrimPrefix(line, "base_url = "), `"`)
@@ -74,12 +85,20 @@ func (r *codexInstallRecorder) dependencies() codexInstallDependencies {
 		login: func(ctx context.Context, _ string, key string, _, _ io.Writer) error {
 			r.contexts = append(r.contexts, ctx)
 			r.loginCalls++
+			r.events = append(r.events, "login")
 			r.loginKey = key
 			return r.loginErr
+		},
+		stopDaemon: func(ctx context.Context, _ string, _, _ io.Writer) error {
+			r.contexts = append(r.contexts, ctx)
+			r.stopDaemonCalls++
+			r.events = append(r.events, "stopDaemon")
+			return r.stopDaemonErr
 		},
 		validate: func(ctx context.Context, _ string, _, _ io.Writer) error {
 			r.contexts = append(r.contexts, ctx)
 			r.validateCalls++
+			r.events = append(r.events, "validate")
 			if len(r.validateErrors) >= r.validateCalls {
 				return r.validateErrors[r.validateCalls-1]
 			}
@@ -92,7 +111,7 @@ func (r *codexInstallRecorder) dependencies() codexInstallDependencies {
 }
 
 func TestInstallCodexInstallsLatestAndAcceptsValidConfiguration(t *testing.T) {
-	recorder := &codexInstallRecorder{versionAfter: "0.151.0"}
+	recorder := &codexRecorder{versionAfter: "0.151.0"}
 	output, err := executeInstallCodex(t, context.Background(), recorder, "")
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
@@ -105,14 +124,17 @@ func TestInstallCodexInstallsLatestAndAcceptsValidConfiguration(t *testing.T) {
 	if recorder.installCalls != 1 || recorder.detectCalls != 2 || recorder.validateCalls != 1 {
 		t.Errorf("calls install=%d detect=%d validate=%d, want 1,2,1", recorder.installCalls, recorder.detectCalls, recorder.validateCalls)
 	}
-	if recorder.writeCalls != 0 || recorder.loginCalls != 0 {
-		t.Errorf("valid setup wrote config/login: write=%d login=%d", recorder.writeCalls, recorder.loginCalls)
+	if recorder.writeCalls != 0 || recorder.loginCalls != 0 || recorder.stopDaemonCalls != 0 {
+		t.Errorf("valid setup changed state: write=%d login=%d stopDaemon=%d", recorder.writeCalls, recorder.loginCalls, recorder.stopDaemonCalls)
+	}
+	if recorder.installCalls != 1 {
+		t.Errorf("install calls = %d, want 1", recorder.installCalls)
 	}
 }
 
 func TestInstallCodexUpdatesExistingVersionAndRepairsConfiguration(t *testing.T) {
 	const secret = "sk-test-super-secret"
-	recorder := &codexInstallRecorder{
+	recorder := &codexRecorder{
 		versionBefore:  "0.150.0",
 		versionAfter:   "0.151.0",
 		validateErrors: []error{errors.New("unauthorized")},
@@ -122,7 +144,7 @@ func TestInstallCodexUpdatesExistingVersionAndRepairsConfiguration(t *testing.T)
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	for _, want := range []string{"0.150.0", "0.151.0", "gpt-6-astra", "ultra", "1000000", "800000", "https://gateway.example.com/v1", codexx.MaskAPIKey(secret), "配置正确，可以使用"} {
+	for _, want := range []string{"0.150.0", "0.151.0", "gpt-6-astra", "ultra", "1000000", "800000", "https://gateway.example.com/v1", codexx.MaskAPIKey(secret), "shared Codex app-server", "配置正确，可以使用"} {
 		if !strings.Contains(output, want) {
 			t.Errorf("output %q does not contain %q", output, want)
 		}
@@ -133,14 +155,15 @@ func TestInstallCodexUpdatesExistingVersionAndRepairsConfiguration(t *testing.T)
 	if recorder.writtenHost != "https://gateway.example.com/v1" || recorder.loginKey != secret {
 		t.Errorf("written host/key = %q/%q", recorder.writtenHost, recorder.loginKey)
 	}
-	if recorder.writeCalls != 1 || recorder.loginCalls != 1 || recorder.validateCalls != 2 {
-		t.Errorf("calls write=%d login=%d validate=%d, want 1,1,2", recorder.writeCalls, recorder.loginCalls, recorder.validateCalls)
+	want := []string{"validate", "write", "login", "stopDaemon", "validate"}
+	if !reflect.DeepEqual(recorder.events, want) {
+		t.Errorf("events = %v, want %v", recorder.events, want)
 	}
 }
 
 func TestInstallCodexPreviewShowsCompleteFinalConfiguration(t *testing.T) {
 	const secret = "sk-test-super-secret"
-	recorder := &codexInstallRecorder{
+	recorder := &codexRecorder{
 		config:         []byte("# keep this\n[history]\npersistence = \"save-all\"\n"),
 		validateErrors: []error{errors.New("bad config")},
 	}
@@ -159,7 +182,7 @@ func TestInstallCodexPreviewShowsCompleteFinalConfiguration(t *testing.T) {
 }
 
 func TestInstallCodexRejectsInvalidHostThenAllowsCancellation(t *testing.T) {
-	recorder := &codexInstallRecorder{validateErrors: []error{errors.New("bad config")}}
+	recorder := &codexRecorder{validateErrors: []error{errors.New("bad config")}}
 	output, err := executeInstallCodex(t, context.Background(), recorder, "not-a-url\nhttps://api.example.com/v1\nsk-secret-key\nno\n")
 	if !errors.Is(err, ErrCodexSetupCancelled) {
 		t.Fatalf("Execute() error = %v, want ErrCodexSetupCancelled", err)
@@ -173,15 +196,17 @@ func TestInstallCodexRejectsInvalidHostThenAllowsCancellation(t *testing.T) {
 }
 
 func TestInstallCodexStopsOnFailuresWithoutReadyMessage(t *testing.T) {
+	const repairInput = "https://api.example.com/v1\nsk-secret-key\nyes\n"
 	tests := []struct {
-		name     string
-		recorder *codexInstallRecorder
-		input    string
-		want     error
+		name          string
+		recorder      *codexRecorder
+		input         string
+		wantValidates int
 	}{
-		{name: "installer", recorder: &codexInstallRecorder{installErr: errors.New("download failed")}, want: nil},
-		{name: "login", recorder: &codexInstallRecorder{validateErrors: []error{errors.New("bad")}, loginErr: errors.New("login failed")}, input: "https://api.example.com/v1\nsk-secret-key\nyes\n", want: nil},
-		{name: "post validation", recorder: &codexInstallRecorder{validateErrors: []error{errors.New("bad"), errors.New("still bad")}}, input: "https://api.example.com/v1\nsk-secret-key\nyes\n", want: nil},
+		{name: "installer", recorder: &codexRecorder{installErr: errors.New("download failed")}},
+		{name: "login", recorder: &codexRecorder{validateErrors: []error{errors.New("bad")}, loginErr: errors.New("login failed")}, input: repairInput, wantValidates: 1},
+		{name: "daemon stop", recorder: &codexRecorder{validateErrors: []error{errors.New("bad")}, stopDaemonErr: errors.New("daemon stop failed")}, input: repairInput, wantValidates: 1},
+		{name: "post validation", recorder: &codexRecorder{validateErrors: []error{errors.New("bad"), errors.New("still bad")}}, input: repairInput, wantValidates: 2},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -192,13 +217,29 @@ func TestInstallCodexStopsOnFailuresWithoutReadyMessage(t *testing.T) {
 			if strings.Contains(output, "配置正确，可以使用") {
 				t.Fatalf("failure output contains ready message: %q", output)
 			}
+			if tt.recorder.validateCalls != tt.wantValidates {
+				t.Errorf("validate calls = %d, want %d", tt.recorder.validateCalls, tt.wantValidates)
+			}
 		})
+	}
+}
+
+func TestInstallCodexExplainsDaemonStopFailure(t *testing.T) {
+	recorder := &codexRecorder{validateErrors: []error{errors.New("bad")}, stopDaemonErr: errors.New("daemon stop failed")}
+	_, err := executeInstallCodex(t, context.Background(), recorder, "https://api.example.com/v1\nsk-secret-key\nyes\n")
+	if err == nil {
+		t.Fatal("Execute() error = nil")
+	}
+	for _, want := range []string{"daemon stop failed", "codex app-server daemon stop"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
 	}
 }
 
 func TestInstallCodexRefusesSudoAndHelpHasNoSideEffects(t *testing.T) {
 	t.Run("sudo", func(t *testing.T) {
-		recorder := &codexInstallRecorder{}
+		recorder := &codexRecorder{}
 		deps := recorder.dependencies()
 		deps.isSudo = func() bool { return true }
 		command := newInstallCodexCmd(deps)
@@ -214,7 +255,7 @@ func TestInstallCodexRefusesSudoAndHelpHasNoSideEffects(t *testing.T) {
 	})
 
 	t.Run("help", func(t *testing.T) {
-		recorder := &codexInstallRecorder{}
+		recorder := &codexRecorder{}
 		command := newInstallCodexCmd(recorder.dependencies())
 		command.SetOut(&bytes.Buffer{})
 		command.SetErr(&bytes.Buffer{})
@@ -231,7 +272,7 @@ func TestInstallCodexRefusesSudoAndHelpHasNoSideEffects(t *testing.T) {
 func TestInstallCodexPropagatesCommandContext(t *testing.T) {
 	type key string
 	ctx := context.WithValue(context.Background(), key("ctx"), "value")
-	recorder := &codexInstallRecorder{}
+	recorder := &codexRecorder{}
 	if _, err := executeInstallCodex(t, ctx, recorder, ""); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
@@ -242,7 +283,7 @@ func TestInstallCodexPropagatesCommandContext(t *testing.T) {
 	}
 }
 
-func executeInstallCodex(t *testing.T, ctx context.Context, recorder *codexInstallRecorder, input string) (string, error) {
+func executeInstallCodex(t *testing.T, ctx context.Context, recorder *codexRecorder, input string) (string, error) {
 	t.Helper()
 	command := newInstallCodexCmd(recorder.dependencies())
 	command.SetContext(ctx)

@@ -18,7 +18,7 @@ import (
 // ErrCodexSetupCancelled reports that the user rejected the proposed config.
 var ErrCodexSetupCancelled = errors.New("Codex setup cancelled")
 
-type codexInstallDependencies struct {
+type codexDependencies struct {
 	isSudo           func() bool
 	resolveCurrent   func() (string, error)
 	resolveInstalled func() (string, error)
@@ -29,11 +29,12 @@ type codexInstallDependencies struct {
 	readConfig       func(context.Context, string) ([]byte, error)
 	writeConfig      func(context.Context, string, []byte, []byte, []byte) (string, error)
 	login            func(context.Context, string, string, io.Writer, io.Writer) error
+	stopDaemon       func(context.Context, string, io.Writer, io.Writer) error
 	validate         func(context.Context, string, io.Writer, io.Writer) error
 	readSecret       func(io.Reader, io.Writer) (string, error)
 }
 
-func newInstallCodexCmd(deps codexInstallDependencies) *cobra.Command {
+func newInstallCodexCmd(deps codexDependencies) *cobra.Command {
 	return &cobra.Command{
 		Use:   "codex",
 		Short: "Install, configure and verify OpenAI Codex CLI",
@@ -42,7 +43,9 @@ func newInstallCodexCmd(deps codexInstallDependencies) *cobra.Command {
 After installation, ft verifies the active configuration with a minimal model
 request. If repair is needed, it asks for a Responses API host and API key,
 shows a masked preview, preserves unrelated config.toml settings, stores the
-credential through "codex login", and validates the result. Run without sudo.`,
+credential through "codex login", stops the shared app-server daemon so the
+next codex launch loads the new settings, and validates the result. Run without
+sudo. To change the host or key later, run "ft codex config".`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runInstallCodex(cmd, deps)
@@ -50,7 +53,7 @@ credential through "codex login", and validates the result. Run without sudo.`,
 	}
 }
 
-func runInstallCodex(cmd *cobra.Command, deps codexInstallDependencies) error {
+func runInstallCodex(cmd *cobra.Command, deps codexDependencies) error {
 	if deps.isSudo() {
 		return fmt.Errorf("do not run this command with sudo; run \"ft install codex\" as the user who will use Codex")
 	}
@@ -105,8 +108,18 @@ func runInstallCodex(cmd *cobra.Command, deps codexInstallDependencies) error {
 	} else {
 		fmt.Fprintf(out, "Current Codex configuration could not be validated: %v\n", err)
 	}
+	return configureCodex(cmd, deps, executable, configPath, existing)
+}
 
+// configureCodex asks for the API host and key, writes config.toml, stores the
+// credential, stops the shared app-server daemon so the next codex launch loads
+// the new settings, and validates the result. existing must be the current
+// config.toml content so the write can refuse concurrent modifications.
+func configureCodex(cmd *cobra.Command, deps codexDependencies, executable, configPath string, existing []byte) error {
+	out := cmd.OutOrStdout()
+	errOut := cmd.ErrOrStderr()
 	input := cmd.InOrStdin()
+
 	host, err := promptHost(input, out)
 	if err != nil {
 		return err
@@ -138,9 +151,13 @@ func runInstallCodex(cmd *cobra.Command, deps codexInstallDependencies) error {
 	if err := deps.login(cmd.Context(), executable, key, out, errOut); err != nil {
 		return fmt.Errorf("saving Codex API key: %w", err)
 	}
+	fmt.Fprintln(out, "Stopping the shared Codex app-server so the next codex launch loads the new configuration...")
+	if err := deps.stopDaemon(cmd.Context(), executable, out, errOut); err != nil {
+		return fmt.Errorf("Codex configuration was saved but the shared app-server could not be stopped: %w; run \"codex app-server daemon stop\" manually before starting codex again", err)
+	}
 	fmt.Fprintln(out, "Validating the new Codex configuration...")
 	if err := deps.validate(cmd.Context(), executable, out, errOut); err != nil {
-		return fmt.Errorf("Codex configuration was saved but validation failed: %w; review the API host and key, then run \"ft install codex\" again", err)
+		return fmt.Errorf("Codex configuration was saved but validation failed: %w; review the API host and key, then run \"%s\" again", err, cmd.CommandPath())
 	}
 	fmt.Fprintln(out, "Codex 配置正确，可以使用。")
 	return nil
@@ -247,10 +264,10 @@ func printCodexConfigPreview(output io.Writer, prepared []byte, key string, will
 	}
 }
 
-func productionCodexInstallDependencies() codexInstallDependencies {
+func productionCodexDependencies() codexDependencies {
 	runner := codexx.ExecRunner{}
 	httpClient := &http.Client{Timeout: 5 * time.Minute}
-	return codexInstallDependencies{
+	return codexDependencies{
 		isSudo: func() bool { return os.Getenv("SUDO_USER") != "" || os.Getenv("SUDO_UID") != "" },
 		resolveCurrent: func() (string, error) {
 			return codexx.ResolveExecutable(os.Getenv("PATH"), os.Getenv("HOME"))
@@ -272,6 +289,9 @@ func productionCodexInstallDependencies() codexInstallDependencies {
 		writeConfig:   codexx.WritePreparedConfig,
 		login: func(ctx context.Context, executable, key string, stdout, stderr io.Writer) error {
 			return codexx.Login(ctx, runner, executable, key, stdout, stderr)
+		},
+		stopDaemon: func(ctx context.Context, executable string, stdout, stderr io.Writer) error {
+			return codexx.StopDaemon(ctx, runner, executable, stdout, stderr)
 		},
 		validate: func(ctx context.Context, executable string, stdout, stderr io.Writer) error {
 			return codexx.Validate(ctx, runner, executable, stdout, stderr)

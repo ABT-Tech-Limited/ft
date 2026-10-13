@@ -87,7 +87,7 @@ firewall settings, or other Fail2Ban configuration files.`,
 	)
 
 	installCmd.AddCommand(
-		newInstallCodexCmd(productionCodexInstallDependencies()),
+		newInstallCodexCmd(productionCodexDependencies()),
 		&cobra.Command{
 			Use:   "docker",
 			Short: "Install Docker Engine, Buildx and Compose",
