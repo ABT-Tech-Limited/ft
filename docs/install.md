@@ -13,7 +13,7 @@ ft install codex
 1. 检测当前 `codex --version`
 2. 下载并执行 OpenAI 官方 standalone installer；未安装时安装 latest，已有版本时检查并更新到 latest
 3. 检测安装后的实际版本（优先 `CODEX_INSTALL_DIR` 或 `~/.local/bin/codex`，避免 PATH 中遗留的 npm/brew 旧版本）
-4. 执行 `codex app-server daemon update`，让共享 app-server 守护进程的包跟上 CLI 版本；正在运行的旧版本守护进程会被重启，已是最新则不动
+4. 执行 `codex app-server daemon update`，让共享 app-server 守护进程的包跟上 CLI 版本；正在运行的旧版本守护进程会被重启，已是最新则不动；若 control socket 被唯一的同用户、已脱离父会话的直接 app-server 占用，ft 会优雅停止它并自动重试
 5. 使用严格配置、临时会话和只读沙箱发起一次最小模型请求
 6. 如果请求成功，提示“Codex 配置正确，可以使用”
 7. 如果失败，交互输入 API 请求地址 HOST 和 API Key，显示完整脱敏配置，确认后保存、停止共享 app-server 守护进程并重新验证

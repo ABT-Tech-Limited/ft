@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os/user"
 	"reflect"
 	"strings"
 	"testing"
@@ -167,6 +168,72 @@ func TestUpdateDaemonParsesStatusAndPassesDiagnostics(t *testing.T) {
 				t.Errorf("stderr = %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+func TestUpdateDaemonRecoversUnmanagedAppServer(t *testing.T) {
+	const diagnostic = "Error: app server is running but is not managed by codex app-server daemon\n"
+	const updateOutput = `{"status":"updated","installedVersion":"0.163.0","runningVersion":"0.163.0","message":"restarted"}`
+	var stderr bytes.Buffer
+	var runner *recordingRunner
+	runner = &recordingRunner{run: func(_ context.Context, command Command) error {
+		switch command.Path + " " + strings.Join(command.Args, " ") {
+		case "/opt/bin/codex app-server daemon update":
+			updates := 0
+			for _, recorded := range runner.commands {
+				if reflect.DeepEqual(recorded.command.Args, command.Args) {
+					updates++
+				}
+			}
+			if updates == 1 {
+				_, _ = command.Stderr.Write([]byte(diagnostic))
+				return errors.New("exit status 1")
+			}
+			_, _ = command.Stdout.Write([]byte(updateOutput))
+		case "ps -axo pid=,ppid=,user=,args=":
+			current, currentErr := user.Current()
+			if currentErr != nil {
+				t.Fatalf("user.Current() error = %v", currentErr)
+			}
+			_, _ = command.Stdout.Write([]byte("22734 1 " + current.Username + " codex -c features.code_mode_host=true app-server --listen unix://\n"))
+		case "kill -TERM 22734":
+		default:
+			t.Fatalf("unexpected command: %#v", command)
+		}
+		return nil
+	}}
+
+	got, err := UpdateDaemon(context.Background(), runner, "/opt/bin/codex", &stderr)
+	if err != nil {
+		t.Fatalf("UpdateDaemon() error = %v", err)
+	}
+	if got.Status != DaemonUpdated || got.RunningVersion != "0.163.0" {
+		t.Fatalf("UpdateDaemon() = %+v, want updated 0.163.0", got)
+	}
+	if len(runner.commands) != 4 {
+		t.Fatalf("UpdateDaemon() ran %d commands, want 4", len(runner.commands))
+	}
+	if !strings.Contains(stderr.String(), "unmanaged") {
+		t.Errorf("stderr = %q, want unmanaged recovery diagnostic", stderr.String())
+	}
+	if strings.Contains(stderr.String(), diagnostic) {
+		t.Errorf("stderr = %q, want recoverable daemon diagnostic hidden", stderr.String())
+	}
+}
+
+func TestParseUnmanagedAppServerPIDsOnlyMatchesDirectServers(t *testing.T) {
+	output := strings.Join([]string{
+		"22734 1 root codex -c features.code_mode_host=true app-server --listen unix://",
+		"22735 1 root codex app-server proxy",
+		"22736 1 root codex app-server daemon update",
+		"22737 1 other codex app-server --listen unix://",
+		"22738 1 root codex app-server --listen ws://127.0.0.1:4500",
+		"22739 123 root codex app-server --listen unix://",
+	}, "\n")
+
+	got := parseUnmanagedAppServerPIDs(output, "root")
+	if !reflect.DeepEqual(got, []int{22734}) {
+		t.Fatalf("parseUnmanagedAppServerPIDs() = %v, want [22734]", got)
 	}
 }
 

@@ -13,7 +13,7 @@ ft codex update
 3. 检测安装后的实际版本，输出“Updated Codex CLI from X to Y”或“Codex CLI X is already the latest release”
 4. 执行 `codex app-server daemon update`，让共享 app-server 守护进程的包跟上 CLI 版本
 
-第 4 步的结果会用一句话说明：守护进程正在运行且版本落后时，Codex 会下载对应版本的守护进程包并重启它；守护进程已停止时只更新包，下次启动 `codex` 生效；版本已是最新时不重启；在这个 `CODEX_HOME` 里从未启动过守护进程时无需处理。该步骤需要联网，有新版本时会额外下载一份与 CLI 同体积的守护进程包。
+第 4 步的结果会用一句话说明：守护进程正在运行且版本落后时，Codex 会下载对应版本的守护进程包并重启它；守护进程已停止时只更新包，下次启动 `codex` 生效；版本已是最新时不重启；在这个 `CODEX_HOME` 里从未启动过守护进程时无需处理。若发现 control socket 被同一用户直接启动、且已脱离父会话（`PPID=1`）的 `codex app-server --listen unix://` 占用，ft 会先确认唯一的目标进程，发送 `SIGTERM` 后自动重试；存在多个候选进程或无法安全识别时会拒绝自动处理。该步骤需要联网，有新版本时会额外下载一份与 CLI 同体积的守护进程包。
 
 命令不修改配置和 Key，也不发起模型请求。必须以实际使用 Codex 的用户直接运行，不要加 `sudo`。安装器或守护进程更新任一步失败都会报错并保留底层错误；守护进程更新失败时 CLI 已更新完成，按提示手动执行 `codex app-server daemon update` 即可。
 
