@@ -27,17 +27,19 @@ ft codex config
 
 1. 原子写入 `~/.codex/config.toml`：重置 ft 托管字段（模型、provider 等），保留无关配置和注释
 2. 通过标准输入调用官方 `codex login --with-api-key` 保存 Key，Key 不出现在参数、日志或 `config.toml` 中
-3. 执行 `codex app-server daemon stop` 停止共享 app-server 守护进程；下次启动 `codex` 时自动拉起新进程并加载新配置
-4. 使用严格配置、临时会话和只读沙箱发起一次最小模型请求验证，成功才提示“Codex 配置正确，可以使用”
+3. 执行 `codex app-server daemon stop` 停止受管理的共享 app-server；下次启动 `codex` 时自动拉起新进程并加载新配置
+4. 使用严格配置、临时会话和只读沙箱发起一次最小模型请求验证；受管理守护进程已停止时提示“Codex 配置正确，可以使用”，外部进程占用控制 socket 时提示重启对应客户端
 
 必须以实际使用 Codex 的用户直接运行，不要加 `sudo`。Codex 未安装时会提示先执行 `ft install codex`。HOST 规则与 `ft install codex` 相同：完整 URL，远程必须 HTTPS，不含用户名、密码、query 或 fragment。ft 托管的默认配置见 [ft install](install.md#安装和配置-codex)。
 
-任一步失败命令立即报错并保留底层错误，不会误报成功。停止守护进程失败时，配置和 Key 已保存，按提示手动执行 `codex app-server daemon stop` 后再启动 `codex`。
+任一步失败命令立即报错并保留底层错误，不会误报成功。停止守护进程失败时，配置和 Key 已保存，按提示处理后再启动 `codex`。
+
+如果 `codex app-server daemon stop` 返回 `app server is running but is not managed by codex app-server daemon`，说明控制 socket 被 Codex 客户端、IDE 扩展或远程会话直接启动的 app-server 占用，而不是 daemon 管理的进程。ft 不会强杀这个进程；它会继续用独立请求验证新配置，并提示完全退出并重新启动对应客户端。配置和 Key 已经保存，重复执行 `daemon stop` 不会解决此状态。
 
 ## 为什么不能只手改文件或只跑官方安装器
 
 Codex 0.162 起交互式 `codex` 默认连接共享的 app-server 守护进程（`codex --no-daemon` 可绕过）。该进程只在启动时读取 `config.toml` 和 `auth.json`，手动改完文件后它仍持有旧 HOST/Key，典型表现是：`codex exec` 和 `codex --no-daemon` 正常，交互式 `codex` 报 `401 Unauthorized`。
 
-`ft codex config` 和 `ft install codex` 的修复流程在保存 Key 后都会停止守护进程，避免这种状态不一致。已经手改过文件的，执行 `codex app-server daemon stop` 或 `codex app-server daemon restart` 再启动 `codex` 即可。
+`ft codex config` 和 `ft install codex` 的修复流程在保存 Key 后都会停止守护进程，避免这种状态不一致。已经手改过文件的，执行 `codex app-server daemon stop` 或 `codex app-server daemon restart` 再启动 `codex` 即可；如果 app-server 是由客户端直接启动的，则完全退出该客户端后重新打开。
 
 版本也有同样的问题。守护进程使用 `~/.codex/packages/app-server-daemon` 下自己的一份 Codex，官方安装器只更新 CLI 对应的 `packages/standalone`，所以只跑安装器之后，正在运行的守护进程仍是旧版本，连 `daemon stop` 再 `start` 也不会换成新包。Codex 自带的后台更新最终会把守护进程更新到最新，但时间不确定。`ft codex update` 和 `ft install codex` 在更新 CLI 后都会执行 `codex app-server daemon update`，让守护进程立即跟上。

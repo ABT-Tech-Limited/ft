@@ -34,7 +34,9 @@ validates the result with a minimal model request.
 
 Editing config.toml or auth.json by hand leaves an already running app-server
 daemon on the old credentials, which surfaces as HTTP 401 in interactive codex
-sessions. Run without sudo, as the user who uses Codex.`,
+sessions. If a Codex client directly owns the app-server socket, ft leaves it
+running and asks you to restart that client. Run without sudo, as the user who
+uses Codex.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runCodexConfig(cmd, deps)

@@ -99,6 +99,26 @@ func TestCodexConfigStopsOnFailuresWithoutReadyMessage(t *testing.T) {
 	}
 }
 
+func TestCodexConfigContinuesWhenAppServerIsUnmanaged(t *testing.T) {
+	recorder := &codexRecorder{stopDaemonErr: codexx.ErrDaemonUnmanaged}
+	output, err := executeCodexConfig(t, context.Background(), recorder, "https://api.example.com/v1\nsk-secret-key\nyes\n")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	want := []string{"write", "login", "stopDaemon", "validate"}
+	if !reflect.DeepEqual(recorder.events, want) {
+		t.Errorf("events = %v, want %v", recorder.events, want)
+	}
+	for _, want := range []string{"未由 codex app-server daemon 管理", "请完全退出并重新启动", "已保存并通过独立请求验证"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("output %q does not contain %q", output, want)
+		}
+	}
+	if strings.Contains(output, "配置正确，可以使用") {
+		t.Fatalf("unmanaged app-server output claims the running client is ready: %q", output)
+	}
+}
+
 func TestCodexConfigRefusesSudoAndHelpHasNoSideEffects(t *testing.T) {
 	t.Run("sudo", func(t *testing.T) {
 		recorder := &codexRecorder{}

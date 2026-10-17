@@ -3,10 +3,17 @@ package codexx
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 )
+
+// ErrDaemonUnmanaged reports that an app-server owns the control socket but
+// was not started by codex app-server daemon, so the CLI must not stop it.
+var ErrDaemonUnmanaged = errors.New("Codex app-server is running but is not managed by codex app-server daemon")
+
+const unmanagedDaemonDiagnostic = "app server is running but is not managed by codex app-server daemon"
 
 // StopDaemon stops the shared Codex app-server daemon of the current
 // CODEX_HOME. The daemon keeps the configuration and credentials it loaded at
@@ -24,16 +31,29 @@ func StopDaemon(ctx context.Context, runner Runner, executable string, stdout, s
 	if strings.TrimSpace(executable) == "" {
 		return fmt.Errorf("empty Codex executable")
 	}
+	var stdoutDiagnostics strings.Builder
+	var stderrDiagnostics strings.Builder
 	err := runner.Run(ctx, Command{
 		Path:   executable,
 		Args:   []string{"app-server", "daemon", "stop"},
-		Stdout: stdout,
-		Stderr: stderr,
+		Stdout: captureWriter(stdout, &stdoutDiagnostics),
+		Stderr: captureWriter(stderr, &stderrDiagnostics),
 	})
 	if err != nil {
+		diagnostics := stdoutDiagnostics.String() + stderrDiagnostics.String()
+		if strings.Contains(strings.ToLower(diagnostics), unmanagedDaemonDiagnostic) {
+			return fmt.Errorf("stop Codex app-server daemon: %w: %w", ErrDaemonUnmanaged, err)
+		}
 		return fmt.Errorf("stop Codex app-server daemon: %w", err)
 	}
 	return nil
+}
+
+func captureWriter(destination io.Writer, capture *strings.Builder) io.Writer {
+	if destination == nil {
+		return capture
+	}
+	return io.MultiWriter(destination, capture)
 }
 
 // DaemonUpdateStatus reports what "codex app-server daemon update" did.

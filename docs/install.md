@@ -38,7 +38,7 @@ HOST 必须是完整 URL，不能包含用户名、密码、query 或 fragment�
 
 确认页会显示最终将写入的完整 `config.toml` 和脱敏后的 Key。API Key 不会写入 `config.toml`、命令参数或日志；`ft` 通过标准输入调用官方 `codex login --with-api-key`，由 Codex 自己写入操作系统凭据存储或 `~/.codex/auth.json`。`~/.codex/config.toml` 中无关的用户配置和注释会保留；新目录和配置文件分别使用 `0700`、`0600` 权限并原子替换。若原 TOML 语法已损坏，确认页会明确说明，写入前先创建 `0600` 权限的 `.bak` 备份；若确认期间配置被其他进程修改，命令会拒绝覆盖并要求重试。
 
-保存 Key 后 ft 会执行 `codex app-server daemon stop`。交互式 `codex` 默认连接共享的 app-server 守护进程，它只在启动时读取 `config.toml` 和 `auth.json`，不停止就会继续用旧 Key 请求（表现为 401）；下次启动 `codex` 会自动拉起新进程。第 5 步的验证请求走 `codex exec`，不经过守护进程，所以它能通过并不代表正在运行的守护进程状态正确。之后只想升级 Codex 版本，运行 `ft codex update`；需要更换 HOST 或 Key，运行 `ft codex config`（均见 [ft codex](codex.md)），不要手改文件。
+保存 Key 后 ft 会执行 `codex app-server daemon stop`。交互式 `codex` 默认连接共享的 app-server 守护进程，它只在启动时读取 `config.toml` 和 `auth.json`，不停止就会继续用旧 Key 请求（表现为 401）；下次启动 `codex` 会自动拉起新进程。第 5 步的验证请求走 `codex exec`，不经过守护进程，所以它能通过并不代表正在运行的守护进程状态正确。如果 app-server 由 Codex 客户端、IDE 扩展或远程会话直接启动，Codex 会报 `app server is running but is not managed by codex app-server daemon` 并拒绝停止；ft 不会强杀该进程，而是提示完全退出并重新启动对应客户端。之后只想升级 Codex 版本，运行 `ft codex update`；需要更换 HOST 或 Key，运行 `ft codex config`（均见 [ft codex](codex.md)），不要手改文件。
 
 如果写入后的真实请求仍失败，命令不会误报成功。检查 HOST 是否指向兼容 Responses API 的 base URL、Key 是否有效，以及该服务是否提供 `gpt-6-astra`，然后重新运行 `ft install codex`。官方安装器默认把命令放在 `~/.local/bin`；当前终端若还找不到 `codex`，执行：
 

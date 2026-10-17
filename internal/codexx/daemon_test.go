@@ -56,6 +56,27 @@ func TestStopDaemonWrapsCommandError(t *testing.T) {
 	}
 }
 
+func TestStopDaemonReportsUnmanagedAppServer(t *testing.T) {
+	const diagnostic = "Error: app server is running but is not managed by codex app-server daemon\n"
+	runErr := errors.New("exit status 1")
+	var stderr bytes.Buffer
+	runner := &recordingRunner{run: func(_ context.Context, command Command) error {
+		_, _ = command.Stderr.Write([]byte(diagnostic))
+		return runErr
+	}}
+
+	err := StopDaemon(context.Background(), runner, "codex", nil, &stderr)
+	if !errors.Is(err, ErrDaemonUnmanaged) {
+		t.Fatalf("StopDaemon() error = %v, want errors.Is(_, ErrDaemonUnmanaged)", err)
+	}
+	if !errors.Is(err, runErr) {
+		t.Fatalf("StopDaemon() error = %v, want errors.Is(_, runErr)", err)
+	}
+	if got := stderr.String(); got != diagnostic {
+		t.Errorf("stderr = %q, want %q", got, diagnostic)
+	}
+}
+
 func TestStopDaemonRejectsInvalidArgumentsWithoutRunningCommand(t *testing.T) {
 	runner := &recordingRunner{}
 	tests := []struct {

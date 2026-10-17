@@ -141,14 +141,24 @@ func configureCodex(cmd *cobra.Command, deps codexDependencies, executable, conf
 		return fmt.Errorf("saving Codex API key: %w", err)
 	}
 	fmt.Fprintln(out, "Stopping the shared Codex app-server so the next codex launch loads the new configuration...")
+	daemonManaged := true
 	if err := deps.stopDaemon(cmd.Context(), executable, out, errOut); err != nil {
-		return fmt.Errorf("Codex configuration was saved but the shared app-server could not be stopped: %w; run \"codex app-server daemon stop\" manually before starting codex again", err)
+		if !errors.Is(err, codexx.ErrDaemonUnmanaged) {
+			return fmt.Errorf("Codex configuration was saved but the shared app-server could not be stopped: %w; run \"codex app-server daemon stop\" manually before starting codex again", err)
+		}
+		daemonManaged = false
+		fmt.Fprintln(out, "当前 Codex app-server 由其他进程启动，未由 codex app-server daemon 管理；ft 无法安全停止它。")
+		fmt.Fprintln(out, "配置和 Key 已保存，但当前 app-server 不会自动加载；请完全退出并重新启动启动它的 Codex 客户端或远程会话。")
 	}
 	fmt.Fprintln(out, "Validating the new Codex configuration...")
 	if err := deps.validate(cmd.Context(), executable, out, errOut); err != nil {
 		return fmt.Errorf("Codex configuration was saved but validation failed: %w; review the API host and key, then run \"%s\" again", err, cmd.CommandPath())
 	}
-	fmt.Fprintln(out, "Codex 配置正确，可以使用。")
+	if daemonManaged {
+		fmt.Fprintln(out, "Codex 配置正确，可以使用。")
+	} else {
+		fmt.Fprintln(out, "Codex 配置已保存并通过独立请求验证；重新启动当前 Codex 客户端或远程会话后生效。")
+	}
 	return nil
 }
 
