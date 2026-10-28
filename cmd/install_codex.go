@@ -29,7 +29,7 @@ type codexDependencies struct {
 	readConfig       func(context.Context, string) ([]byte, error)
 	writeConfig      func(context.Context, string, []byte, []byte, []byte) (string, error)
 	login            func(context.Context, string, string, io.Writer, io.Writer) error
-	stopDaemon       func(context.Context, string, io.Writer, io.Writer) error
+	reloadDaemon     func(context.Context, string, io.Writer, io.Writer) error
 	updateDaemon     func(context.Context, string, io.Writer) (codexx.DaemonUpdate, error)
 	validate         func(context.Context, string, io.Writer, io.Writer) error
 	readSecret       func(io.Reader, io.Writer) (string, error)
@@ -45,9 +45,10 @@ After installation, ft verifies the active configuration with a minimal model
 request. If repair is needed, it asks for a Responses API host and API key,
 shows a masked preview, preserves unrelated config.toml settings, stores the
 credential through "codex login", updates the shared app-server daemon package,
-stops that daemon so the next codex launch loads the new settings, and
-validates the result. Run without sudo. To change the host or key later, run
-"ft codex config"; to only update the CLI, run "ft codex update".`,
+reloads the server with the new settings, and validates the result.
+Reloading disconnects clients and may interrupt running tasks; use a separate
+SSH terminal after pausing Codex work. Run without sudo. To change the host or
+key later, run "ft codex config"; to only update the CLI, run "ft codex update".`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runInstallCodex(cmd, deps)
@@ -101,9 +102,9 @@ func runInstallCodex(cmd *cobra.Command, deps codexDependencies) error {
 }
 
 // configureCodex asks for the API host and key, writes config.toml, stores the
-// credential, stops the shared app-server daemon so the next codex launch loads
-// the new settings, and validates the result. existing must be the current
-// config.toml content so the write can refuse concurrent modifications.
+// credential, reloads the shared app-server with the new settings, and validates
+// the result. existing must be the current config.toml content so the write
+// can refuse concurrent modifications.
 func configureCodex(cmd *cobra.Command, deps codexDependencies, executable, configPath string, existing []byte) error {
 	out := cmd.OutOrStdout()
 	errOut := cmd.ErrOrStderr()
@@ -122,6 +123,7 @@ func configureCodex(cmd *cobra.Command, deps codexDependencies, executable, conf
 		return fmt.Errorf("preparing Codex configuration: %w", err)
 	}
 	printCodexConfigPreview(out, prepared, key, backup != nil)
+	fmt.Fprintln(out, "Reloading the shared Codex app-server will disconnect clients and may interrupt running tasks. Use a separate SSH terminal.")
 	confirmed, err := promptConfirmation(input, out)
 	if err != nil {
 		return err
@@ -140,25 +142,16 @@ func configureCodex(cmd *cobra.Command, deps codexDependencies, executable, conf
 	if err := deps.login(cmd.Context(), executable, key, out, errOut); err != nil {
 		return fmt.Errorf("saving Codex API key: %w", err)
 	}
-	fmt.Fprintln(out, "Stopping the shared Codex app-server so the next codex launch loads the new configuration...")
-	daemonManaged := true
-	if err := deps.stopDaemon(cmd.Context(), executable, out, errOut); err != nil {
-		if !errors.Is(err, codexx.ErrDaemonUnmanaged) {
-			return fmt.Errorf("Codex configuration was saved but the shared app-server could not be stopped: %w; run \"codex app-server daemon stop\" manually before starting codex again", err)
-		}
-		daemonManaged = false
-		fmt.Fprintln(out, "当前 Codex app-server 由其他进程启动，未由 codex app-server daemon 管理；ft 无法安全停止它。")
-		fmt.Fprintln(out, "配置和 Key 已保存，但当前 app-server 不会自动加载；请完全退出并重新启动启动它的 Codex 客户端或远程会话。")
+	fmt.Fprintln(out, "Reloading the shared Codex app-server to load the new configuration...")
+	if err := deps.reloadDaemon(cmd.Context(), executable, out, errOut); err != nil {
+		return fmt.Errorf("Codex configuration and API key were saved but the shared app-server could not be reloaded: %w; resolve the server issue, then run \"ft codex reload\" from a separate terminal; no need to enter the host/key again", err)
 	}
 	fmt.Fprintln(out, "Validating the new Codex configuration...")
 	if err := deps.validate(cmd.Context(), executable, out, errOut); err != nil {
 		return fmt.Errorf("Codex configuration was saved but validation failed: %w; review the API host and key, then run \"%s\" again", err, cmd.CommandPath())
 	}
-	if daemonManaged {
-		fmt.Fprintln(out, "Codex 配置正确，可以使用。")
-	} else {
-		fmt.Fprintln(out, "Codex 配置已保存并通过独立请求验证；重新启动当前 Codex 客户端或远程会话后生效。")
-	}
+	fmt.Fprintln(out, "Codex app-server 已重载；独立模型请求验证通过。请重新连接客户端。")
+	fmt.Fprintln(out, "Codex 配置正确，可以使用。")
 	return nil
 }
 
@@ -338,8 +331,8 @@ func productionCodexDependencies() codexDependencies {
 		login: func(ctx context.Context, executable, key string, stdout, stderr io.Writer) error {
 			return codexx.Login(ctx, runner, executable, key, stdout, stderr)
 		},
-		stopDaemon: func(ctx context.Context, executable string, stdout, stderr io.Writer) error {
-			return codexx.StopDaemon(ctx, runner, executable, stdout, stderr)
+		reloadDaemon: func(ctx context.Context, executable string, stdout, stderr io.Writer) error {
+			return codexx.ReloadDaemon(ctx, runner, executable, stdout, stderr)
 		},
 		updateDaemon: func(ctx context.Context, executable string, stderr io.Writer) (codexx.DaemonUpdate, error) {
 			return codexx.UpdateDaemon(ctx, runner, executable, stderr)

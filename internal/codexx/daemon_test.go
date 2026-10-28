@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"os/user"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -66,15 +66,15 @@ func TestStopDaemonReportsUnmanagedAppServer(t *testing.T) {
 		return runErr
 	}}
 
-	err := StopDaemon(context.Background(), runner, "codex", nil, &stderr)
+	err := stopDaemon(context.Background(), runner, "codex", nil, &stderr, func(context.Context, io.Writer) error { return errors.New("cannot verify socket owner") })
 	if !errors.Is(err, ErrDaemonUnmanaged) {
 		t.Fatalf("StopDaemon() error = %v, want errors.Is(_, ErrDaemonUnmanaged)", err)
 	}
 	if !errors.Is(err, runErr) {
 		t.Fatalf("StopDaemon() error = %v, want errors.Is(_, runErr)", err)
 	}
-	if got := stderr.String(); got != diagnostic {
-		t.Errorf("stderr = %q, want %q", got, diagnostic)
+	if strings.Contains(stderr.String(), diagnostic) {
+		t.Errorf("recoverable raw error leaked: %s", stderr.String())
 	}
 }
 
@@ -172,68 +172,48 @@ func TestUpdateDaemonParsesStatusAndPassesDiagnostics(t *testing.T) {
 }
 
 func TestUpdateDaemonRecoversUnmanagedAppServer(t *testing.T) {
-	const diagnostic = "Error: app server is running but is not managed by codex app-server daemon\n"
-	const updateOutput = `{"status":"updated","installedVersion":"0.163.0","runningVersion":"0.163.0","message":"restarted"}`
+	var events []string
 	var stderr bytes.Buffer
-	var runner *recordingRunner
-	runner = &recordingRunner{run: func(_ context.Context, command Command) error {
-		switch command.Path + " " + strings.Join(command.Args, " ") {
-		case "/opt/bin/codex app-server daemon update":
-			updates := 0
-			for _, recorded := range runner.commands {
-				if reflect.DeepEqual(recorded.command.Args, command.Args) {
-					updates++
-				}
-			}
+	updates, stops := 0, 0
+	runner := &recordingRunner{run: func(_ context.Context, c Command) error {
+		action := c.Args[len(c.Args)-1]
+		events = append(events, action)
+		switch action {
+		case "update":
+			updates++
 			if updates == 1 {
-				_, _ = command.Stderr.Write([]byte(diagnostic))
+				io.WriteString(c.Stderr, "Error: "+unmanagedDaemonDiagnostic)
 				return errors.New("exit status 1")
 			}
-			_, _ = command.Stdout.Write([]byte(updateOutput))
-		case "ps -axo pid=,ppid=,user=,args=":
-			current, currentErr := user.Current()
-			if currentErr != nil {
-				t.Fatalf("user.Current() error = %v", currentErr)
+			io.WriteString(c.Stdout, `{"status":"updated","installedVersion":"0.165.0"}`)
+		case "stop":
+			stops++
+			if stops == 1 {
+				io.WriteString(c.Stderr, "Error: "+unmanagedDaemonDiagnostic)
+				return errors.New("exit status 1")
 			}
-			_, _ = command.Stdout.Write([]byte("22734 1 " + current.Username + " codex -c features.code_mode_host=true app-server --listen unix://\n"))
-		case "kill -TERM 22734":
+			io.WriteString(c.Stdout, `{"status":"notRunning"}`)
 		default:
-			t.Fatalf("unexpected command: %#v", command)
+			t.Fatalf("unexpected action: %s", action)
 		}
 		return nil
 	}}
-
-	got, err := UpdateDaemon(context.Background(), runner, "/opt/bin/codex", &stderr)
+	got, err := updateDaemon(context.Background(), runner, "codex", &stderr, func(context.Context, io.Writer) error {
+		events = append(events, "recover")
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("UpdateDaemon() error = %v", err)
+		t.Fatal(err)
 	}
-	if got.Status != DaemonUpdated || got.RunningVersion != "0.163.0" {
-		t.Fatalf("UpdateDaemon() = %+v, want updated 0.163.0", got)
+	if got.Status != DaemonUpdated {
+		t.Fatalf("update = %+v", got)
 	}
-	if len(runner.commands) != 4 {
-		t.Fatalf("UpdateDaemon() ran %d commands, want 4", len(runner.commands))
+	want := []string{"update", "stop", "recover", "stop", "update"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events=%v want=%v", events, want)
 	}
-	if !strings.Contains(stderr.String(), "unmanaged") {
-		t.Errorf("stderr = %q, want unmanaged recovery diagnostic", stderr.String())
-	}
-	if strings.Contains(stderr.String(), diagnostic) {
-		t.Errorf("stderr = %q, want recoverable daemon diagnostic hidden", stderr.String())
-	}
-}
-
-func TestParseUnmanagedAppServerPIDsOnlyMatchesDirectServers(t *testing.T) {
-	output := strings.Join([]string{
-		"22734 1 root codex -c features.code_mode_host=true app-server --listen unix://",
-		"22735 1 root codex app-server proxy",
-		"22736 1 root codex app-server daemon update",
-		"22737 1 other codex app-server --listen unix://",
-		"22738 1 root codex app-server --listen ws://127.0.0.1:4500",
-		"22739 123 root codex app-server --listen unix://",
-	}, "\n")
-
-	got := parseUnmanagedAppServerPIDs(output, "root")
-	if !reflect.DeepEqual(got, []int{22734}) {
-		t.Fatalf("parseUnmanagedAppServerPIDs() = %v, want [22734]", got)
+	if strings.Contains(stderr.String(), "Error:") {
+		t.Fatalf("recoverable error leaked: %s", stderr.String())
 	}
 }
 

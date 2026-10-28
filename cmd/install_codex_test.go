@@ -20,7 +20,7 @@ type codexRecorder struct {
 	readCalls         int
 	writeCalls        int
 	loginCalls        int
-	stopDaemonCalls   int
+	reloadDaemonCalls int
 	updateDaemonCalls int
 	validateCalls     int
 	validateErrors    []error
@@ -33,7 +33,7 @@ type codexRecorder struct {
 	installErr        error
 	writeErr          error
 	loginErr          error
-	stopDaemonErr     error
+	reloadDaemonErr   error
 	updateDaemonErr   error
 	detectErr         error
 	daemonUpdate      codexx.DaemonUpdate
@@ -97,11 +97,11 @@ func (r *codexRecorder) dependencies() codexDependencies {
 			r.loginKey = key
 			return r.loginErr
 		},
-		stopDaemon: func(ctx context.Context, _ string, _, _ io.Writer) error {
+		reloadDaemon: func(ctx context.Context, _ string, _, _ io.Writer) error {
 			r.contexts = append(r.contexts, ctx)
-			r.stopDaemonCalls++
-			r.events = append(r.events, "stopDaemon")
-			return r.stopDaemonErr
+			r.reloadDaemonCalls++
+			r.events = append(r.events, "reloadDaemon")
+			return r.reloadDaemonErr
 		},
 		updateDaemon: func(ctx context.Context, _ string, _ io.Writer) (codexx.DaemonUpdate, error) {
 			r.contexts = append(r.contexts, ctx)
@@ -144,8 +144,8 @@ func TestInstallCodexInstallsLatestAndAcceptsValidConfiguration(t *testing.T) {
 	if recorder.installCalls != 1 || recorder.detectCalls != 2 || recorder.validateCalls != 1 {
 		t.Errorf("calls install=%d detect=%d validate=%d, want 1,2,1", recorder.installCalls, recorder.detectCalls, recorder.validateCalls)
 	}
-	if recorder.writeCalls != 0 || recorder.loginCalls != 0 || recorder.stopDaemonCalls != 0 {
-		t.Errorf("valid setup changed state: write=%d login=%d stopDaemon=%d", recorder.writeCalls, recorder.loginCalls, recorder.stopDaemonCalls)
+	if recorder.writeCalls != 0 || recorder.loginCalls != 0 || recorder.reloadDaemonCalls != 0 {
+		t.Errorf("valid setup changed state: write=%d login=%d reloadDaemon=%d", recorder.writeCalls, recorder.loginCalls, recorder.reloadDaemonCalls)
 	}
 	want := []string{"install", "updateDaemon", "validate"}
 	if !reflect.DeepEqual(recorder.events, want) {
@@ -179,7 +179,7 @@ func TestInstallCodexUpdatesExistingVersionAndRepairsConfiguration(t *testing.T)
 	if recorder.writtenHost != "https://gateway.example.com/v1" || recorder.loginKey != secret {
 		t.Errorf("written host/key = %q/%q", recorder.writtenHost, recorder.loginKey)
 	}
-	want := []string{"install", "updateDaemon", "validate", "write", "login", "stopDaemon", "validate"}
+	want := []string{"install", "updateDaemon", "validate", "write", "login", "reloadDaemon", "validate"}
 	if !reflect.DeepEqual(recorder.events, want) {
 		t.Errorf("events = %v, want %v", recorder.events, want)
 	}
@@ -230,7 +230,7 @@ func TestInstallCodexStopsOnFailuresWithoutReadyMessage(t *testing.T) {
 		{name: "installer", recorder: &codexRecorder{installErr: errors.New("download failed")}},
 		{name: "daemon update", recorder: &codexRecorder{updateDaemonErr: errors.New("daemon update failed")}},
 		{name: "login", recorder: &codexRecorder{validateErrors: []error{errors.New("bad")}, loginErr: errors.New("login failed")}, input: repairInput, wantValidates: 1},
-		{name: "daemon stop", recorder: &codexRecorder{validateErrors: []error{errors.New("bad")}, stopDaemonErr: errors.New("daemon stop failed")}, input: repairInput, wantValidates: 1},
+		{name: "daemon reload", recorder: &codexRecorder{validateErrors: []error{errors.New("bad")}, reloadDaemonErr: errors.New("daemon reload failed")}, input: repairInput, wantValidates: 1},
 		{name: "post validation", recorder: &codexRecorder{validateErrors: []error{errors.New("bad"), errors.New("still bad")}}, input: repairInput, wantValidates: 2},
 	}
 	for _, tt := range tests {
@@ -249,13 +249,13 @@ func TestInstallCodexStopsOnFailuresWithoutReadyMessage(t *testing.T) {
 	}
 }
 
-func TestInstallCodexExplainsDaemonStopFailure(t *testing.T) {
-	recorder := &codexRecorder{validateErrors: []error{errors.New("bad")}, stopDaemonErr: errors.New("daemon stop failed")}
+func TestInstallCodexExplainsDaemonReloadFailure(t *testing.T) {
+	recorder := &codexRecorder{validateErrors: []error{errors.New("bad")}, reloadDaemonErr: errors.New("daemon reload failed")}
 	_, err := executeInstallCodex(t, context.Background(), recorder, "https://api.example.com/v1\nsk-secret-key\nyes\n")
 	if err == nil {
 		t.Fatal("Execute() error = nil")
 	}
-	for _, want := range []string{"daemon stop failed", "codex app-server daemon stop"} {
+	for _, want := range []string{"daemon reload failed", "ft codex reload"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not contain %q", err, want)
 		}

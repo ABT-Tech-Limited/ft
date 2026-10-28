@@ -11,7 +11,7 @@ import (
 	"github.com/ABT-Tech-Limited/ft/internal/codexx"
 )
 
-func TestCodexConfigWritesCredentialsStopsDaemonAndValidates(t *testing.T) {
+func TestCodexConfigWritesCredentialsReloadsDaemonAndValidates(t *testing.T) {
 	const secret = "sk-test-super-secret"
 	recorder := &codexRecorder{config: []byte("# keep this\n[history]\npersistence = \"save-all\"\n")}
 	input := " https://gateway.example.com/v1/// \n" + secret + "\nyes\n"
@@ -30,7 +30,7 @@ func TestCodexConfigWritesCredentialsStopsDaemonAndValidates(t *testing.T) {
 	if recorder.writtenHost != "https://gateway.example.com/v1" || recorder.loginKey != secret {
 		t.Errorf("written host/key = %q/%q", recorder.writtenHost, recorder.loginKey)
 	}
-	want := []string{"write", "login", "stopDaemon", "validate"}
+	want := []string{"write", "login", "reloadDaemon", "validate"}
 	if !reflect.DeepEqual(recorder.events, want) {
 		t.Errorf("events = %v, want %v", recorder.events, want)
 	}
@@ -77,8 +77,8 @@ func TestCodexConfigStopsOnFailuresWithoutReadyMessage(t *testing.T) {
 	}{
 		{name: "write", recorder: &codexRecorder{writeErr: errors.New("disk full")}, wantEvents: []string{"write"}, wantInErr: "disk full"},
 		{name: "login", recorder: &codexRecorder{loginErr: errors.New("login failed")}, wantEvents: []string{"write", "login"}, wantInErr: "login failed"},
-		{name: "daemon stop", recorder: &codexRecorder{stopDaemonErr: errors.New("daemon stop failed")}, wantEvents: []string{"write", "login", "stopDaemon"}, wantInErr: "codex app-server daemon stop"},
-		{name: "validation", recorder: &codexRecorder{validateErrors: []error{errors.New("still bad")}}, wantEvents: []string{"write", "login", "stopDaemon", "validate"}, wantInErr: "still bad"},
+		{name: "daemon reload", recorder: &codexRecorder{reloadDaemonErr: errors.New("daemon reload failed")}, wantEvents: []string{"write", "login", "reloadDaemon"}, wantInErr: "ft codex reload"},
+		{name: "validation", recorder: &codexRecorder{validateErrors: []error{errors.New("still bad")}}, wantEvents: []string{"write", "login", "reloadDaemon", "validate"}, wantInErr: "still bad"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -99,23 +99,20 @@ func TestCodexConfigStopsOnFailuresWithoutReadyMessage(t *testing.T) {
 	}
 }
 
-func TestCodexConfigContinuesWhenAppServerIsUnmanaged(t *testing.T) {
-	recorder := &codexRecorder{stopDaemonErr: codexx.ErrDaemonUnmanaged}
+func TestCodexConfigDoesNotClaimSuccessWhenUnmanagedRecoveryFails(t *testing.T) {
+	recorder := &codexRecorder{reloadDaemonErr: codexx.ErrDaemonUnmanaged}
 	output, err := executeCodexConfig(t, context.Background(), recorder, "https://api.example.com/v1\nsk-secret-key\nyes\n")
-	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
+	if !errors.Is(err, codexx.ErrDaemonUnmanaged) {
+		t.Fatalf("Execute() error = %v, want unmanaged recovery failure", err)
 	}
-	want := []string{"write", "login", "stopDaemon", "validate"}
-	if !reflect.DeepEqual(recorder.events, want) {
-		t.Errorf("events = %v, want %v", recorder.events, want)
+	if recorder.validateCalls != 0 {
+		t.Fatal("must not validate independently and hide a failed reload")
 	}
-	for _, want := range []string{"未由 codex app-server daemon 管理", "请完全退出并重新启动", "已保存并通过独立请求验证"} {
-		if !strings.Contains(output, want) {
-			t.Errorf("output %q does not contain %q", output, want)
-		}
+	if !strings.Contains(err.Error(), "saved") || !strings.Contains(err.Error(), "codex reload") {
+		t.Errorf("error must explain credentials are saved and reload can be retried: %v", err)
 	}
-	if strings.Contains(output, "配置正确，可以使用") {
-		t.Fatalf("unmanaged app-server output claims the running client is ready: %q", output)
+	if strings.Contains(output, "配置正确，可以使用") || strings.Contains(output, "已保存并通过") {
+		t.Fatalf("unmanaged recovery failure reports success: %q", output)
 	}
 }
 

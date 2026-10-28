@@ -59,6 +59,14 @@ func TestConfigPath(t *testing.T) {
 		{name: "CODEX_HOME wins", codexHome: "/srv/codex", home: "/home/user", want: "/srv/codex/config.toml"},
 		{name: "default under HOME", home: "/home/user", want: "/home/user/.codex/config.toml"},
 		{name: "no home", wantErr: "HOME"},
+		{name: "trailing whitespace", codexHome: "/srv/codex ", wantErr: "CODEX_HOME"},
+		{name: "leading whitespace", codexHome: " /srv/codex", wantErr: "CODEX_HOME"},
+		{name: "whitespace is not unset", codexHome: " ", home: "/home/user", wantErr: "CODEX_HOME"},
+		{name: "relative codex home", codexHome: "codex", wantErr: "CODEX_HOME"},
+		{name: "parent traversal", codexHome: "/srv/link/../codex", wantErr: "CODEX_HOME"},
+		{name: "home parent traversal", home: "/home/link/../user", wantErr: "HOME"},
+		{name: "home whitespace", home: "/home/user ", wantErr: "HOME"},
+		{name: "internal spaces", codexHome: "/srv/codex home", want: "/srv/codex home/config.toml"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

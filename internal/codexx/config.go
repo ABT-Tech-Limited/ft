@@ -74,12 +74,25 @@ func isLoopbackHost(host string) bool {
 
 // ConfigPath resolves the user-level Codex config path.
 func ConfigPath(codexHome, home string) (string, error) {
-	base := strings.TrimSpace(codexHome)
+	base, name := codexHome, "CODEX_HOME"
 	if base == "" {
-		if strings.TrimSpace(home) == "" {
-			return "", fmt.Errorf("HOME is not set")
+		base, name = home, "HOME"
+	}
+	if base == "" {
+		return "", fmt.Errorf("%s is not set", name)
+	}
+	// Codex inherits the raw environment. Trimming or cleaning an ambiguous
+	// path here could make config writes and process recovery target another home.
+	if base != strings.TrimSpace(base) || !filepath.IsAbs(base) {
+		return "", fmt.Errorf("%s must be an absolute path without leading or trailing whitespace", name)
+	}
+	for _, component := range strings.Split(filepath.ToSlash(base), "/") {
+		if component == ".." {
+			return "", fmt.Errorf("%s must not contain '..'; use its resolved absolute path", name)
 		}
-		base = filepath.Join(home, ".codex")
+	}
+	if codexHome == "" {
+		base = filepath.Join(base, ".codex")
 	}
 	return filepath.Join(base, "config.toml"), nil
 }

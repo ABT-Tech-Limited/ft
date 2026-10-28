@@ -6,121 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os/user"
-	"strconv"
 	"strings"
 )
 
 // ErrDaemonUnmanaged reports that an app-server owns the control socket but
-// was not started by codex app-server daemon, so the CLI must not stop it.
+// was not started by codex app-server daemon. Recovery must verify its identity
+// before signaling it, because the Codex CLI cannot manage this process.
 var ErrDaemonUnmanaged = errors.New("Codex app-server is running but is not managed by codex app-server daemon")
 
 const unmanagedDaemonDiagnostic = "app server is running but is not managed by codex app-server daemon"
 
-// StopDaemon stops the shared Codex app-server daemon of the current
-// CODEX_HOME. The daemon keeps the configuration and credentials it loaded at
-// startup, so interactive codex sessions keep using stale values after
-// config.toml or auth.json change. Stopping it is enough: the next codex
-// launch starts a fresh daemon from the current files. Codex exits
-// successfully when no daemon is running.
+// StopDaemon stops the managed daemon, or safely terminates the verified
+// owner of the current CODEX_HOME control socket before retrying the stop.
 func StopDaemon(ctx context.Context, runner Runner, executable string, stdout, stderr io.Writer) error {
-	if ctx == nil {
-		return fmt.Errorf("nil daemon stop context")
-	}
-	if runner == nil {
-		return fmt.Errorf("nil command runner")
-	}
-	if strings.TrimSpace(executable) == "" {
-		return fmt.Errorf("empty Codex executable")
-	}
-	var stdoutDiagnostics strings.Builder
-	var stderrDiagnostics strings.Builder
-	err := runner.Run(ctx, Command{
-		Path:   executable,
-		Args:   []string{"app-server", "daemon", "stop"},
-		Stdout: captureWriter(stdout, &stdoutDiagnostics),
-		Stderr: captureWriter(stderr, &stderrDiagnostics),
-	})
-	if err != nil {
-		diagnostics := stdoutDiagnostics.String() + stderrDiagnostics.String()
-		if strings.Contains(strings.ToLower(diagnostics), unmanagedDaemonDiagnostic) {
-			return fmt.Errorf("stop Codex app-server daemon: %w: %w", ErrDaemonUnmanaged, err)
-		}
-		return fmt.Errorf("stop Codex app-server daemon: %w", err)
-	}
-	return nil
-}
-
-func captureWriter(destination io.Writer, capture *strings.Builder) io.Writer {
-	if destination == nil {
-		return capture
-	}
-	return io.MultiWriter(destination, capture)
-}
-
-func recoverUnmanagedAppServer(ctx context.Context, runner Runner, stderr io.Writer) error {
-	currentUser, err := user.Current()
-	if err != nil {
-		return fmt.Errorf("resolve current user: %w", err)
-	}
-
-	var processes strings.Builder
-	if err := runner.Run(ctx, Command{
-		Path:   "ps",
-		Args:   []string{"-axo", "pid=,ppid=,user=,args="},
-		Stdout: &processes,
-	}); err != nil {
-		return fmt.Errorf("list current user's app-server processes: %w", err)
-	}
-	pids := parseUnmanagedAppServerPIDs(processes.String(), currentUser.Username)
-	if len(pids) == 0 {
-		return fmt.Errorf("could not identify an orphaned unmanaged app-server process owned by %q", currentUser.Username)
-	}
-	if len(pids) > 1 {
-		return fmt.Errorf("found %d orphaned unmanaged app-server processes owned by %q; refusing to stop them automatically", len(pids), currentUser.Username)
-	}
-
-	pid := strconv.Itoa(pids[0])
-	if err := runner.Run(ctx, Command{
-		Path: "kill",
-		Args: []string{"-TERM", pid},
-	}); err != nil {
-		return fmt.Errorf("stop unmanaged app-server process %s: %w", pid, err)
-	}
-	if stderr != nil {
-		fmt.Fprintf(stderr, "Detected unmanaged Codex app-server process %s; sent SIGTERM before retrying daemon update.\n", pid)
-	}
-	return nil
-}
-
-func parseUnmanagedAppServerPIDs(output, currentUser string) []int {
-	var pids []int
-	for _, line := range strings.Split(output, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 4 || fields[2] != currentUser || fields[1] != "1" {
-			continue
-		}
-		pid, err := strconv.Atoi(fields[0])
-		if err != nil || !isDirectAppServerCommand(strings.Join(fields[3:], " ")) {
-			continue
-		}
-		pids = append(pids, pid)
-	}
-	return pids
-}
-
-func isDirectAppServerCommand(command string) bool {
-	fields := strings.Fields(command)
-	for index, field := range fields {
-		if field != "app-server" || index+2 >= len(fields) {
-			continue
-		}
-		if fields[index+1] == "proxy" || fields[index+1] == "daemon" {
-			return false
-		}
-		return fields[index+1] == "--listen" && strings.HasPrefix(fields[index+2], "unix://")
-	}
-	return false
+	return stopDaemon(ctx, runner, executable, stdout, stderr, recoverUnmanagedAppServer)
 }
 
 // DaemonUpdateStatus reports what "codex app-server daemon update" did.
@@ -156,6 +55,10 @@ type daemonUpdateOutput struct {
 // and a plain daemon restart do not refresh. Command diagnostics are passed to
 // stderr; the single JSON result line is returned as a parsed DaemonUpdate.
 func UpdateDaemon(ctx context.Context, runner Runner, executable string, stderr io.Writer) (DaemonUpdate, error) {
+	return updateDaemon(ctx, runner, executable, stderr, recoverUnmanagedAppServer)
+}
+
+func updateDaemon(ctx context.Context, runner Runner, executable string, stderr io.Writer, recover recoverServer) (DaemonUpdate, error) {
 	if ctx == nil {
 		return DaemonUpdate{}, fmt.Errorf("nil daemon update context")
 	}
@@ -178,7 +81,7 @@ func UpdateDaemon(ctx context.Context, runner Runner, executable string, stderr 
 		if stderr != nil {
 			fmt.Fprintln(stderr, "The shared app-server is unmanaged; locating and stopping the direct app-server process before retrying...")
 		}
-		if recoverErr := recoverUnmanagedAppServer(ctx, runner, stderr); recoverErr != nil {
+		if recoverErr := stopDaemon(ctx, runner, executable, nil, stderr, recover); recoverErr != nil {
 			return DaemonUpdate{}, fmt.Errorf("recover unmanaged Codex app-server: %w", recoverErr)
 		}
 		output.Reset()

@@ -13,10 +13,10 @@ ft install codex
 1. 检测当前 `codex --version`
 2. 下载并执行 OpenAI 官方 standalone installer；未安装时安装 latest，已有版本时检查并更新到 latest
 3. 检测安装后的实际版本（优先 `CODEX_INSTALL_DIR` 或 `~/.local/bin/codex`，避免 PATH 中遗留的 npm/brew 旧版本）
-4. 执行 `codex app-server daemon update`，让共享 app-server 守护进程的包跟上 CLI 版本；正在运行的旧版本守护进程会被重启，已是最新则不动；若 control socket 被唯一的同用户、已脱离父会话的直接 app-server 占用，ft 会优雅停止它并自动重试
+4. 执行 `codex app-server daemon update`，让共享 app-server 守护进程的包跟上 CLI 版本；正在运行的旧版本守护进程会被重启，已是最新则不动；若更新明确报告未托管 server，Linux 上会核对 control socket 实际监听者的身份，以 `SIGTERM` 停止并等待退出后重试
 5. 使用严格配置、临时会话和只读沙箱发起一次最小模型请求
 6. 如果请求成功，提示“Codex 配置正确，可以使用”
-7. 如果失败，交互输入 API 请求地址 HOST 和 API Key，显示完整脱敏配置，确认后保存、停止共享 app-server 守护进程并重新验证
+7. 如果失败，交互输入 API 请求地址 HOST 和 API Key，显示完整脱敏配置，确认后保存、重载共享 app-server 并重新验证
 
 `ft` 管理以下 Codex 默认配置：
 
@@ -38,7 +38,9 @@ HOST 必须是完整 URL，不能包含用户名、密码、query 或 fragment�
 
 确认页会显示最终将写入的完整 `config.toml` 和脱敏后的 Key。API Key 不会写入 `config.toml`、命令参数或日志；`ft` 通过标准输入调用官方 `codex login --with-api-key`，由 Codex 自己写入操作系统凭据存储或 `~/.codex/auth.json`。`~/.codex/config.toml` 中无关的用户配置和注释会保留；新目录和配置文件分别使用 `0700`、`0600` 权限并原子替换。若原 TOML 语法已损坏，确认页会明确说明，写入前先创建 `0600` 权限的 `.bak` 备份；若确认期间配置被其他进程修改，命令会拒绝覆盖并要求重试。
 
-保存 Key 后 ft 会执行 `codex app-server daemon stop`。交互式 `codex` 默认连接共享的 app-server 守护进程，它只在启动时读取 `config.toml` 和 `auth.json`，不停止就会继续用旧 Key 请求（表现为 401）；下次启动 `codex` 会自动拉起新进程。第 5 步的验证请求走 `codex exec`，不经过守护进程，所以它能通过并不代表正在运行的守护进程状态正确。如果 app-server 由 Codex 客户端、IDE 扩展或远程会话直接启动，Codex 会报 `app server is running but is not managed by codex app-server daemon` 并拒绝停止；ft 不会强杀该进程，而是提示完全退出并重新启动对应客户端。之后只想升级 Codex 版本，运行 `ft codex update`；需要更换 HOST 或 Key，运行 `ft codex config`（均见 [ft codex](codex.md)），不要手改文件。
+保存 Key 后 ft 会执行与 `ft codex reload` 相同的流程：停止旧 server、启动受管理 daemon，并验证运行状态。Linux 上遇到未托管的直接 app-server 时，按当前 `CODEX_HOME` 的 socket 核实 PID/UID、可执行文件和启动参数，通过 pidfd 发送 `SIGTERM` 并等待退出，不依赖 `PPID=1`，不使用 `SIGKILL`。不能确认身份、超时或被外部程序重新拉起时明确报错，不再仅提示后继续声称成功。详细安全边界见 [ft codex](codex.md#重载现有配置)。
+
+重载会断开客户端并可能中断任务，请先暂停任务，在独立 SSH 终端操作。第 5 步的模型请求走 `codex exec`，不经过共享 daemon，请求成功不能证明旧 server 已加载配置。之后只想升级 CLI，运行 `ft codex update`；更换 HOST/Key，运行 `ft codex config`；只重新加载已有配置，运行 `ft codex reload`。重载失败时配置和 Key 已保存，处理进程问题后直接重试 `ft codex reload`，无需重复输入。
 
 如果写入后的真实请求仍失败，命令不会误报成功。检查 HOST 是否指向兼容 Responses API 的 base URL、Key 是否有效，以及该服务是否提供 `gpt-6-astra`，然后重新运行 `ft install codex`。官方安装器默认把命令放在 `~/.local/bin`；当前终端若还找不到 `codex`，执行：
 

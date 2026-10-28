@@ -13,11 +13,13 @@ func newCodexCmd(deps codexDependencies) *cobra.Command {
 		Long: `Manage the user-level OpenAI Codex CLI installation and configuration.
 
 Use "ft install codex" for first-time setup, "ft codex update" to move to the
-latest release, and "ft codex config" to change the API host or key.`,
+latest release, "ft codex config" to change the API host or key, and
+"ft codex reload" to restart the server with the existing configuration.`,
 		Args: cobra.NoArgs,
 	}
 	codexCmd.AddCommand(newCodexConfigCmd(deps))
 	codexCmd.AddCommand(newCodexUpdateCmd(deps))
+	codexCmd.AddCommand(newCodexReloadCmd(deps))
 	return codexCmd
 }
 
@@ -28,15 +30,16 @@ func newCodexConfigCmd(deps codexDependencies) *cobra.Command {
 		Long: `Update the Responses API host and API key used by Codex.
 
 ft asks for the host and key, shows a masked preview, preserves unrelated
-config.toml settings, stores the credential through "codex login", stops the
-shared app-server daemon so the next codex launch loads the new settings, and
+config.toml settings, stores the credential through "codex login", reloads the
+shared app-server with the new settings, and
 validates the result with a minimal model request.
 
 Editing config.toml or auth.json by hand leaves an already running app-server
 daemon on the old credentials, which surfaces as HTTP 401 in interactive codex
-sessions. If a Codex client directly owns the app-server socket, ft leaves it
-running and asks you to restart that client. Run without sudo, as the user who
-uses Codex.`,
+sessions. On Linux, ft can safely terminate a verified same-user direct server
+owning the current CODEX_HOME control socket and replace it with a managed daemon.
+Reloading disconnects clients and may interrupt tasks: pause work and use a
+separate SSH terminal. Run without sudo, as the user who uses Codex.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runCodexConfig(cmd, deps)
