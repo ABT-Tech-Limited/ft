@@ -143,6 +143,18 @@ func Nginx() Plan {
 	}
 }
 
+// Ncdu returns the installation plan for Ubuntu's ncdu package.
+func Ncdu() Plan {
+	packages := []string{"ncdu"}
+	return Plan{
+		RequiredPackages: packages,
+		SetupSteps: []Step{
+			{Title: "Updating package index", Argv: aptx.Update()},
+			{Title: "Installing ncdu", Argv: aptx.Install(packages...)},
+		},
+	}
+}
+
 // Fail2ban returns the installation plan for Ubuntu's Fail2Ban package and
 // its default nftables-backed SSH jail.
 func Fail2ban() Plan {

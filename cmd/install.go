@@ -28,11 +28,11 @@ type installDependencies struct {
 func newInstallCmd(deps installDependencies) *cobra.Command {
 	installCmd := &cobra.Command{
 		Use:   "install",
-		Short: "Install and start server software",
+		Short: "Install server software and command-line tools",
 		Long: `Install server software using supported, auditable package sources.
 
 Currently available: Docker Engine from Docker's official apt repository,
-plus Nginx and Fail2Ban from Ubuntu's apt repositories, and OpenAI Codex CLI.`,
+plus Nginx, ncdu and Fail2Ban from Ubuntu's apt repositories, and OpenAI Codex CLI.`,
 		Args: cobra.NoArgs,
 	}
 	var fail2banSSHPort int
@@ -141,6 +141,18 @@ Docker group membership.`,
 					return err
 				}
 				return runInstallPlan(cmd, "Nginx", installer.Nginx(), deps)
+			},
+		},
+		&cobra.Command{
+			Use:   "ncdu",
+			Short: "Install ncdu disk usage analyzer",
+			Long:  "Install ncdu from Ubuntu's apt repositories without launching the interactive analyzer.",
+			Args:  cobra.NoArgs,
+			RunE: func(cmd *cobra.Command, args []string) error {
+				if _, err := deps.detectOS(); err != nil {
+					return err
+				}
+				return runInstallPlan(cmd, "ncdu", installer.Ncdu(), deps)
 			},
 		},
 		fail2banCmd,

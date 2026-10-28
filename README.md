@@ -19,6 +19,7 @@ curl --proto '=https' -fsSL https://raw.githubusercontent.com/ABT-Tech-Limited/f
 ft init                # 初始化系统：apt 更新升级 + 安装常用工具
 ft install docker      # 安装并启动 Docker Engine（官方 apt 源）
 ft install nginx       # 安装并启动 Nginx
+ft install ncdu        # 安装 ncdu 交互式磁盘占用分析工具
 ft install fail2ban    # 安装并启动 Fail2Ban SSH 防护（自动同步 SSH 端口）
 ft install codex       # 安装/更新 Codex CLI，配置并验证自定义 API
 ft codex update        # 更新 Codex CLI 到最新版，并同步共享 app-server
@@ -36,7 +37,7 @@ ft --help              # 查看全部命令
 详细说明：
 
 - [ft init — 系统初始化](docs/init.md)
-- [ft install / ft update — 软件安装与更新](docs/install.md)（Docker、Nginx、Fail2Ban、Codex、自更新）
+- [ft install / ft update — 软件安装与更新](docs/install.md)（Docker、Nginx、ncdu、Fail2Ban、Codex、自更新）
 - [ft codex — Codex 更新与配置管理](docs/codex.md)（更新到最新版、更新 API HOST/Key，自动同步共享 app-server）
 - [ft ssh — SSH 端口管理](docs/ssh.md)
 - [ft ufw — 防火墙管理](docs/ufw.md)（Cloudflare 白名单、状态、重载）

@@ -818,7 +818,7 @@ func TestInstallStopsAtFailedStep(t *testing.T) {
 }
 
 func TestInstallRejectsArguments(t *testing.T) {
-	for _, subcommand := range []string{"docker", "nginx", "fail2ban"} {
+	for _, subcommand := range []string{"docker", "nginx", "ncdu", "fail2ban"} {
 		t.Run(subcommand, func(t *testing.T) {
 			recorder := newInstallRecorder(nil)
 			_, err := executeInstall(t, recorder, subcommand, "unexpected")

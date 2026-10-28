@@ -1,6 +1,6 @@
 # ft install / ft update — 软件安装与更新
 
-Docker、Nginx 和 Fail2Ban 安装命令会先校验操作系统；每一步实时透传输出，任一步失败立即停止并保留底层退出码。Codex 是独立的用户级安装流程，不受 Ubuntu apt 检查限制。
+Docker、Nginx、ncdu 和 Fail2Ban 安装命令会先校验操作系统；每一步实时透传输出，任一步失败立即停止并保留底层退出码。Codex 是独立的用户级安装流程，不受 Ubuntu apt 检查限制。
 
 ## 安装和配置 Codex
 
@@ -83,6 +83,20 @@ ft install nginx
 该命令从 Ubuntu 官方仓库安装 `nginx`，然后启动 `nginx.service` 并设为开机启动。它不会修改 UFW、防火墙、TLS 证书或站点配置。
 
 如果 `nginx` 包已完整安装，命令会跳过 apt 更新和包安装，不升级现有版本，只确保服务已启动并开机自启；缺失或半配置时才执行完整安装流程。
+
+## 安装 ncdu
+
+```bash
+ft install ncdu
+```
+
+该命令从 Ubuntu 官方仓库安装 `ncdu` 交互式磁盘占用分析工具。安装前通过 `dpkg-query` 检查包状态：已完整安装时跳过 apt 更新和包安装，不升级现有版本；缺失或半配置时执行 apt 更新和安装以补齐/修复。
+
+ncdu 不需要后台服务，安装命令不会启动服务或自动进入交互界面。安装后可手动分析指定目录，例如：
+
+```bash
+ncdu /var/log
+```
 
 ## 安装 Fail2Ban
 
