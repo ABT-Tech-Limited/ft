@@ -18,7 +18,7 @@ func newUFWStatusCmd(deps ufwDependencies) *cobra.Command {
 
 The report covers the firewall state (active/inactive, default policies,
 logging), whether ufw starts at boot, whether ufw-docker gates
-Docker-published ports, whether the hourly Cloudflare refresh is
+Docker-published ports, whether the 10-minute Cloudflare refresh is
 registered, and the full numbered rule list with a count of the
 ft-managed Cloudflare rules.
 
@@ -77,13 +77,17 @@ func runUFWStatus(cmd *cobra.Command, deps ufwDependencies) error {
 
 	cronState := "not registered (run \"ft ufw cloudflare\" to set it up)"
 	if lines := managedCronLines(ctx, deps); lines != "" {
-		if minute := parseCronMinute(lines); minute >= 0 {
-			cronState = fmt.Sprintf("registered (minute %d, %s)", minute, cronFilePath)
+		if minute, hourly := parseCronSchedule(lines); minute >= 0 {
+			if hourly {
+				cronState = fmt.Sprintf("registered (hourly at minute %d, %s); re-run \"ft ufw cloudflare\" to migrate to every 10 minutes", minute, cronFilePath)
+			} else {
+				cronState = fmt.Sprintf("registered (every 10 minutes, offset %d, %s)", minute, cronFilePath)
+			}
 		} else {
-			cronState = fmt.Sprintf("registered (%s)", cronFilePath)
+			cronState = fmt.Sprintf("unrecognized schedule (%s); re-run \"ft ufw cloudflare\" to repair", cronFilePath)
 		}
 	}
-	fmt.Fprintf(out, "Hourly Cloudflare refresh: %s\n", cronState)
+	fmt.Fprintf(out, "Cloudflare refresh: %s\n", cronState)
 
 	if !verbose.Active {
 		fmt.Fprintln(out, "\nufw is inactive; allow your SSH port first, then enable it with \"sudo ufw enable\".")

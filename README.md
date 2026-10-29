@@ -18,7 +18,10 @@ curl --proto '=https' -fsSL https://raw.githubusercontent.com/ABT-Tech-Limited/f
 ```bash
 ft init                # 初始化系统：apt 更新升级 + 安装常用工具
 ft install docker      # 安装并启动 Docker Engine（官方 apt 源）
-ft install nginx       # 安装并启动 Nginx
+ft install nginx       # 安装、优化 Nginx，注册每 10 分钟 Cloudflare 网段同步
+ft nginx configure     # 为已安装的 Nginx 应用默认优化与同步配置
+ft nginx example       # 输出 Go 反代和静态网站示例（不写文件）
+ft nginx cloudflare sync # 手动同步 Nginx 信任的 Cloudflare 网段
 ft install ncdu        # 安装 ncdu 交互式磁盘占用分析工具
 ft install fail2ban    # 安装并启动 Fail2Ban SSH 防护（自动同步 SSH 端口）
 ft install codex       # 安装/更新 Codex CLI，配置并验证自定义 API
@@ -27,7 +30,7 @@ ft codex config        # 更新 Codex API HOST/Key，重启共享 app-server 并
 ft codex reload        # 不修改 HOST/Key，重启 app-server 加载现有配置
 ft ssh port            # 查看当前生效的 SSH 端口
 ft ssh port 10222      # 修改 SSH 端口（校验后重启，自动同步 fail2ban，检测 ufw）
-ft ufw cloudflare      # 仅允许 Cloudflare IP 访问 80/443，自动注册每小时刷新
+ft ufw cloudflare      # 仅允许 Cloudflare IP 访问 80/443，每 10 分钟自动刷新
 ft ufw status          # 查看 ufw 状态与全部规则（含 ft 托管规则统计）
 ft ufw reload          # 重载规则并重启 ufw 服务，随后校验防火墙仍在运行
 ft update              # 更新到最新稳定版（SHA-256 校验 + 原子替换）
@@ -39,6 +42,7 @@ ft --help              # 查看全部命令
 
 - [ft init — 系统初始化](docs/init.md)
 - [ft install / ft update — 软件安装与更新](docs/install.md)（Docker、Nginx、ncdu、Fail2Ban、Codex、自更新）
+- [ft nginx — 默认优化、配置示例与 Cloudflare 同步](docs/nginx.md)（Go 反代、WebSocket、静态资源缓存）
 - [ft codex — Codex 更新与配置管理](docs/codex.md)（更新到最新版、更新 API HOST/Key、重载配置）
 - [ft ssh — SSH 端口管理](docs/ssh.md)
 - [ft ufw — 防火墙管理](docs/ufw.md)（Cloudflare 白名单、状态、重载）

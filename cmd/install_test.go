@@ -54,6 +54,7 @@ func newInstallRecorder(statuses map[string]dpkgx.Status) *installRecorder {
 
 func (r *installRecorder) dependencies() installDependencies {
 	return installDependencies{
+		executable: func() (string, error) { return "/usr/local/bin/ft", nil },
 		detectOS: func() (osrelease.Info, error) {
 			r.detected++
 			if r.detectErr != nil {
@@ -122,6 +123,9 @@ func TestInstallAbsentPackagesRunExpectedSteps(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			recorder := newInstallRecorder(nil)
 			wantSteps := tt.plan.Steps(false)
+			if tt.command == "nginx" {
+				wantSteps = append(wantSteps, nginxConfigureTestStep())
+			}
 			if tt.command == "docker" {
 				recorder.dockerGroupUsername = "ubuntu"
 				recorder.dockerGroupShouldAdd = true
@@ -171,6 +175,9 @@ func TestInstallAlreadyInstalledSkipsPackageSetup(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			recorder := newInstallRecorder(installedStatuses(tt.plan.RequiredPackages))
 			wantSteps := tt.plan.Steps(true)
+			if tt.command == "nginx" {
+				wantSteps = append(wantSteps, nginxConfigureTestStep())
+			}
 			if tt.command == "docker" {
 				recorder.dockerGroupUsername = "ubuntu"
 				recorder.dockerGroupShouldAdd = true
@@ -864,7 +871,7 @@ func TestInstallPassesCommandContext(t *testing.T) {
 	if len(recorder.queryContexts) != 1 || recorder.queryContexts[0] != ctx {
 		t.Errorf("query contexts = %v, want command context", recorder.queryContexts)
 	}
-	if len(recorder.runContexts) != 1 || recorder.runContexts[0] != ctx {
+	if len(recorder.runContexts) != 2 || recorder.runContexts[0] != ctx || recorder.runContexts[1] != ctx {
 		t.Errorf("run contexts = %v, want command context", recorder.runContexts)
 	}
 }
@@ -897,6 +904,13 @@ func executeInstall(t *testing.T, recorder *installRecorder, args ...string) (st
 	command.SetArgs(args)
 	err := command.Execute()
 	return output.String(), err
+}
+
+func nginxConfigureTestStep() installer.Step {
+	return installer.Step{
+		Title: "Configuring Nginx defaults and Cloudflare refresh",
+		Argv:  []string{"/usr/local/bin/ft", "nginx", "configure"},
+	}
 }
 
 func mustDockerPlan(t *testing.T) installer.Plan {

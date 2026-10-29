@@ -7,6 +7,7 @@ import (
 	"maps"
 	"math/rand/v2"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -50,7 +51,7 @@ type ufwDependencies struct {
 	output        func(context.Context, []string) ([]byte, error)
 	run           func(context.Context, []string, io.Reader) error
 	executable    func() (string, error)
-	// cronMinute returns the minute (1-59) for a fresh hourly cron entry.
+	// cronMinute returns the offset (0-9) for a fresh 10-minute cron entry.
 	cronMinute func() int
 	fetch      cloudflarex.FetchFunc
 }
@@ -110,7 +111,7 @@ adds one allow rule per Cloudflare range tagged "` + managedRuleComment + `".
 When the existing rules already match the fetched list, nothing changes.
 
 The command registers itself in ` + cronFilePath + ` to run
-every hour, so the allowed ranges follow Cloudflare's updates (output is
+every 10 minutes, so the allowed ranges follow Cloudflare's updates (output is
 appended to ` + cronLogPath + `). Remove that file to stop
 the automatic refresh.
 
@@ -142,6 +143,10 @@ func runUFWCloudflare(cmd *cobra.Command, deps ufwDependencies) error {
 	executablePath, err := deps.executable()
 	if err != nil {
 		return fmt.Errorf("resolving the ft executable path for cron failed: %w", err)
+	}
+	quotedExecutablePath, err := quoteUFWCronExecutable(executablePath)
+	if err != nil {
+		return err
 	}
 	ctx := cmd.Context()
 	out := cmd.OutOrStdout()
@@ -226,7 +231,7 @@ func runUFWCloudflare(cmd *cobra.Command, deps ufwDependencies) error {
 
 	var warnings []string
 	if !conflictFound && managedRulesInSync(rules, ranges, ufwDockerReady) {
-		// The common hourly-cron case: skipping the rebuild avoids both the
+		// The common scheduled-refresh case: skipping the rebuild avoids both the
 		// rule churn and the brief window in which Cloudflare is blocked.
 		fmt.Fprintln(out, "Managed rules already match the fetched ranges; no firewall changes needed.")
 		warnings = ufwx.RuleWarnings(rules, cloudflareTCPPorts)
@@ -237,7 +242,7 @@ func runUFWCloudflare(cmd *cobra.Command, deps ufwDependencies) error {
 		}
 	}
 
-	cronRegistered, err := registerCronRefresh(cmd, deps, statuses["cron"], executablePath)
+	cronRegistered, err := registerCronRefresh(cmd, deps, statuses["cron"], quotedExecutablePath)
 	if err != nil {
 		return err
 	}
@@ -251,7 +256,7 @@ func runUFWCloudflare(cmd *cobra.Command, deps ufwDependencies) error {
 		fmt.Fprintf(out, "Warning: %s\n", warning)
 	}
 	if cronRegistered {
-		fmt.Fprintln(out, "The allowed ranges refresh automatically every hour via cron; rules are rewritten only when Cloudflare's list changes.")
+		fmt.Fprintln(out, "The allowed ranges refresh automatically every 10 minutes via cron; rules are rewritten only when Cloudflare's list changes.")
 	}
 	fmt.Fprintln(out, "SSH and all other port rules were left untouched.")
 	return nil
@@ -445,33 +450,36 @@ func rebuildFirewallRules(
 	return warnings, nil
 }
 
-// registerCronRefresh writes the hourly cron entry and reports whether it was
+// registerCronRefresh writes the 10-minute cron entry and reports whether it was
 // registered. A missing cron package downgrades to a warning: the firewall
 // work already succeeded and must not be reported as failed.
-func registerCronRefresh(cmd *cobra.Command, deps ufwDependencies, cronStatus dpkgx.Status, executablePath string) (bool, error) {
+func registerCronRefresh(cmd *cobra.Command, deps ufwDependencies, cronStatus dpkgx.Status, quotedExecutablePath string) (bool, error) {
 	ctx := cmd.Context()
 	out := cmd.OutOrStdout()
 	if cronStatus != dpkgx.Installed {
-		fmt.Fprintln(out, "Warning: the cron package is missing or broken, so the hourly Cloudflare refresh was not registered.")
+		fmt.Fprintln(out, "Warning: the cron package is missing or broken, so the 10-minute Cloudflare refresh was not registered.")
 		fmt.Fprintln(out, "Install it (\"sudo apt-get update && sudo apt-get install cron\") and re-run this command,")
 		fmt.Fprintln(out, "or re-run \"ft ufw cloudflare\" manually whenever Cloudflare updates its ranges.")
 		return false, nil
 	}
 
-	fmt.Fprintln(out, "\n==> Registering hourly Cloudflare refresh in cron")
-	// A random minute (1-59, never the crowded top of the hour) spreads
-	// servers across the hour instead of hammering Cloudflare's endpoints
-	// together. Once registered the minute is reused, so the hourly self-run
-	// never reshuffles its own schedule.
+	fmt.Fprintln(out, "\n==> Registering Cloudflare refresh every 10 minutes in cron")
+	// Preserve each host's offset, including when migrating an hourly entry,
+	// instead of rescheduling every host at the same ten-minute boundaries.
 	minute := parseCronMinute(managedCronLines(ctx, deps))
 	if minute < 0 {
 		minute = deps.cronMinute()
+		if minute < 0 || minute > 9 {
+			return false, fmt.Errorf("registering the 10-minute refresh failed: cron offset %d is outside 0-9", minute)
+		}
 	}
+	minute %= 10
 	content := fmt.Sprintf(
 		"# Managed by ft. Re-run \"ft ufw cloudflare\" to update, remove this file to stop.\n"+
-			"# Refreshes the Cloudflare allow rules for TCP ports %s every hour.\n"+
-			"%d * * * * root %q ufw cloudflare >> %s 2>&1\n",
-		cloudflarePortsSpec, minute, executablePath, cronLogPath,
+			"# Refreshes the Cloudflare allow rules for TCP ports %s every 10 minutes.\n"+
+			"SHELL=/bin/sh\nPATH=/usr/sbin:/usr/bin:/sbin:/bin\n"+
+			"%d-59/10 * * * * root %s ufw cloudflare >> %s 2>&1\n",
+		cloudflarePortsSpec, minute, quotedExecutablePath, cronLogPath,
 	)
 	steps := []struct {
 		argv  []string
@@ -492,18 +500,33 @@ func registerCronRefresh(cmd *cobra.Command, deps ufwDependencies, cronStatus dp
 		}
 		if err := deps.run(ctx, step.argv, input); err != nil {
 			return false, fmt.Errorf(
-				"registering the hourly refresh failed: %w; the firewall rules are already applied — fix the cause and re-run, or add the cron entry manually",
+				"registering the 10-minute refresh failed: %w; the firewall rules are already applied — fix the cause and re-run, or add the cron entry manually",
 				err,
 			)
 		}
 	}
-	fmt.Fprintf(out, "Hourly refresh registered (minute %d) at %s (logs: %s).\n", minute, cronFilePath, cronLogPath)
+	fmt.Fprintf(out, "Refresh every 10 minutes registered (offset %d) at %s (logs: %s).\n", minute, cronFilePath, cronLogPath)
 	return true, nil
 }
 
-// parseCronMinute extracts the minute of the managed hourly entry from cron
-// file content, or -1 when no valid entry exists.
+func quoteUFWCronExecutable(path string) (string, error) {
+	// Cron interprets '%' before the shell, even inside shell quotes.
+	if !filepath.IsAbs(path) || strings.ContainsAny(path, "\x00\r\n%") {
+		return "", fmt.Errorf("ft executable must be an absolute cron-safe path")
+	}
+	return "'" + strings.ReplaceAll(path, "'", "'\\''") + "'", nil
+}
+
+// parseCronMinute returns a 10-minute offset or a legacy hourly minute,
+// or -1 when no recognized managed entry exists.
 func parseCronMinute(content string) int {
+	minute, _ := parseCronSchedule(content)
+	return minute
+}
+
+// parseCronSchedule also reports legacy hourly entries so status can describe
+// their actual cadence before the next refresh migrates them.
+func parseCronSchedule(content string) (minute int, hourly bool) {
 	for line := range strings.SplitSeq(content, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
@@ -513,16 +536,70 @@ func parseCronMinute(content string) int {
 			continue
 		}
 		fields := strings.Fields(trimmed)
-		if len(fields) < 6 || fields[1] != "*" {
+		if len(fields) < 9 || fields[1] != "*" || fields[2] != "*" || fields[3] != "*" || fields[4] != "*" || fields[5] != "root" {
+			continue
+		}
+		if !isUFWCronCommand(strings.Join(fields[6:], " ")) {
+			continue
+		}
+		if fields[0] == "*/10" {
+			return 0, false
+		}
+		if offset, ok := strings.CutSuffix(fields[0], "-59/10"); ok {
+			minute, err := strconv.Atoi(offset)
+			if err == nil && minute >= 0 && minute <= 9 && strconv.Itoa(minute) == offset {
+				return minute, false
+			}
 			continue
 		}
 		minute, err := strconv.Atoi(fields[0])
-		if err != nil || minute < 0 || minute > 59 {
+		if err == nil && minute >= 0 && minute <= 59 && strconv.Itoa(minute) == fields[0] {
+			return minute, true
+		}
+	}
+	return -1, false
+}
+
+// isUFWCronCommand skips one shell-quoted executable word without evaluating it.
+// This handles both legacy double quotes and current single-quoted paths.
+func isUFWCronCommand(command string) bool {
+	var quote byte
+	escaped := false
+	for i := 0; i < len(command); i++ {
+		c := command[i]
+		if quote == '\'' {
+			if c == '\'' {
+				quote = 0
+			}
 			continue
 		}
-		return minute
+		if escaped {
+			escaped = false
+			continue
+		}
+		if c == '\\' {
+			escaped = true
+			continue
+		}
+		if quote == '"' {
+			if c == '"' {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
+		case '#':
+			if i == 0 {
+				return false
+			}
+		case ' ', '\t':
+			args := strings.Fields(command[i:])
+			return len(args) >= 2 && args[0] == "ufw" && args[1] == "cloudflare"
+		}
 	}
-	return -1
+	return false
 }
 
 // runFirewallCommand wraps rule-changing failures with their fail-closed
@@ -545,7 +622,7 @@ func init() {
 		output:        sysx.OutputContext,
 		run:           sysx.RunInputContext,
 		executable:    os.Executable,
-		cronMinute:    func() int { return rand.IntN(59) + 1 },
+		cronMinute:    func() int { return rand.IntN(10) },
 		fetch:         cloudflarex.Fetch,
 	}))
 }

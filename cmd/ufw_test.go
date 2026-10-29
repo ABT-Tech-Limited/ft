@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
@@ -24,11 +25,11 @@ const (
 
 	testExecutable = "/usr/local/bin/ft"
 
-	testCronMinute = 23
+	testCronMinute = 3
 
 	testCronFile = "# Managed by ft. Re-run \"ft ufw cloudflare\" to update, remove this file to stop.\n" +
-		"# Refreshes the Cloudflare allow rules for TCP ports 80,443 every hour.\n" +
-		"41 * * * * root \"/usr/local/bin/ft\" ufw cloudflare >> /var/log/ft-ufw-cloudflare.log 2>&1\n"
+		"# Refreshes the Cloudflare allow rules for TCP ports 80,443 every 10 minutes.\n" +
+		"1-59/10 * * * * root \"/usr/local/bin/ft\" ufw cloudflare >> /var/log/ft-ufw-cloudflare.log 2>&1\n"
 )
 
 var testSortedRanges = []string{
@@ -290,8 +291,13 @@ func TestUFWCloudflareHappyPathWithoutDocker(t *testing.T) {
 	assertCommands(t, recorder.commands, want)
 
 	cronContent := recorder.commands[len(recorder.commands)-2].input
-	if !strings.Contains(cronContent, `23 * * * * root "/usr/local/bin/ft" ufw cloudflare >> /var/log/ft-ufw-cloudflare.log 2>&1`) {
-		t.Errorf("cron file content %q does not contain the hourly entry", cronContent)
+	if !strings.Contains(cronContent, `3-59/10 * * * * root '/usr/local/bin/ft' ufw cloudflare >> /var/log/ft-ufw-cloudflare.log 2>&1`) {
+		t.Errorf("cron file content %q does not contain the 10-minute entry", cronContent)
+	}
+	for _, setting := range []string{"SHELL=/bin/sh\n", "PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"} {
+		if !strings.Contains(cronContent, setting) {
+			t.Errorf("cron file content lacks %q", setting)
+		}
 	}
 	if !strings.Contains(cronContent, "Managed by ft") {
 		t.Errorf("cron file content %q lacks the managed-by marker", cronContent)
@@ -306,8 +312,8 @@ func TestUFWCloudflareHappyPathWithoutDocker(t *testing.T) {
 	if !strings.Contains(output, "No conflicting rules found.") {
 		t.Errorf("output %q does not mention the empty cleanup", output)
 	}
-	if !strings.Contains(output, "every hour") {
-		t.Errorf("output %q does not mention the hourly refresh", output)
+	if !strings.Contains(output, "every 10 minutes") {
+		t.Errorf("output %q does not mention the 10-minute refresh", output)
 	}
 }
 
@@ -319,8 +325,8 @@ func TestUFWCloudflareKeepsExistingCronMinute(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	cronContent := recorder.commands[len(recorder.commands)-2].input
-	if !strings.Contains(cronContent, "41 * * * * root") {
-		t.Errorf("cron file content %q does not keep the existing minute 41", cronContent)
+	if !strings.Contains(cronContent, "1-59/10 * * * * root") {
+		t.Errorf("cron file content %q does not keep the existing offset 1", cronContent)
 	}
 	if recorder.cronMinuteCalls != 0 {
 		t.Errorf("cronMinute called %d times, want 0 when a valid entry exists", recorder.cronMinuteCalls)
@@ -335,11 +341,161 @@ func TestUFWCloudflarePicksFreshMinuteWhenCronFileUnparseable(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	cronContent := recorder.commands[len(recorder.commands)-2].input
-	if !strings.Contains(cronContent, "23 * * * * root") {
+	if !strings.Contains(cronContent, "3-59/10 * * * * root") {
 		t.Errorf("cron file content %q does not use the fresh minute", cronContent)
 	}
 	if recorder.cronMinuteCalls != 1 {
 		t.Errorf("cronMinute called %d times, want 1", recorder.cronMinuteCalls)
+	}
+}
+
+func TestUFWCloudflareMigratesHourlyCronWithoutChangingRules(t *testing.T) {
+	for _, minute := range []int{0, 17, 41, 59} {
+		t.Run(fmt.Sprint(minute), func(t *testing.T) {
+			recorder := newUFWRecorder()
+			recorder.numbered = []string{testNumberedInSync}
+			recorder.cronFile = textResponse{content: fmt.Sprintf(
+				"%d * * * * root %q ufw cloudflare >> %s 2>&1\n", minute, testExecutable, cronLogPath,
+			)}
+			if _, err := executeUFW(t, recorder, "cloudflare"); err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			assertCommands(t, recorder.commands, cronArgvs())
+			want := fmt.Sprintf("%d-59/10 * * * * root", minute%10)
+			if !strings.Contains(recorder.commands[0].input, want) {
+				t.Errorf("cron content %q does not migrate to %q", recorder.commands[0].input, want)
+			}
+			if recorder.cronMinuteCalls != 0 {
+				t.Errorf("cronMinute called %d times, want 0 for legacy entry", recorder.cronMinuteCalls)
+			}
+		})
+	}
+}
+
+func TestUFWCloudflareRepeatRefreshKeepsSameSchedule(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.numbered = []string{testNumberedInSync}
+	if _, err := executeUFW(t, recorder, "cloudflare"); err != nil {
+		t.Fatalf("first Execute() error = %v", err)
+	}
+	first := recorder.commands[0].input
+	recorder.cronFile = textResponse{content: first}
+	recorder.commands = nil
+	if _, err := executeUFW(t, recorder, "cloudflare"); err != nil {
+		t.Fatalf("second Execute() error = %v", err)
+	}
+	assertCommands(t, recorder.commands, cronArgvs())
+	if got := recorder.commands[0].input; got != first {
+		t.Errorf("repeated cron content changed\nfirst: %q\nnext: %q", first, got)
+	}
+	if recorder.cronMinuteCalls != 1 {
+		t.Errorf("cronMinute called %d times, want once across both runs", recorder.cronMinuteCalls)
+	}
+}
+
+func TestUFWCloudflareRejectsInvalidFreshCronOffset(t *testing.T) {
+	for _, offset := range []int{-1, 10} {
+		t.Run(fmt.Sprint(offset), func(t *testing.T) {
+			recorder := newUFWRecorder()
+			recorder.numbered = []string{testNumberedInSync}
+			recorder.cronMinute = offset
+			_, err := executeUFW(t, recorder, "cloudflare")
+			if err == nil || !strings.Contains(err.Error(), "cron offset") {
+				t.Fatalf("Execute() error = %v, want invalid cron offset", err)
+			}
+			if len(recorder.commands) != 0 {
+				t.Errorf("invalid offset caused commands %v, want none", recorder.commands)
+			}
+		})
+	}
+}
+
+func TestUFWCloudflareCronQuotesExecutableLiterally(t *testing.T) {
+	for _, path := range []string{
+		"/usr/local/bin/ft", "/opt/ft tools/ft", "/opt/it's ft/ft", "/opt/#ft/ft",
+		"/opt/$HOME/ft", "/opt/$(printf expanded)/ft", "/opt/`printf expanded`/ft",
+	} {
+		t.Run(path, func(t *testing.T) {
+			recorder := newUFWRecorder()
+			recorder.numbered = []string{testNumberedInSync}
+			recorder.executablePath = path
+			if _, err := executeUFW(t, recorder, "cloudflare"); err != nil {
+				t.Fatal(err)
+			}
+			content := recorder.commands[0].input
+			var quoted string
+			for line := range strings.SplitSeq(content, "\n") {
+				_, command, ok := strings.Cut(line, " root ")
+				if ok {
+					quoted = strings.TrimSuffix(command, " ufw cloudflare >> "+cronLogPath+" 2>&1")
+				}
+			}
+			if quoted == "" {
+				t.Fatal("no quoted executable in cron entry")
+			}
+			// printf checks shell interpretation without executing the test path.
+			output, err := exec.Command("/bin/sh", "-c", "printf '%s' "+quoted).Output()
+			if err != nil || string(output) != path {
+				t.Errorf("shell parsed path as %q, error=%v; want literal %q", output, err, path)
+			}
+			if got := parseCronMinute(content); got != testCronMinute {
+				t.Errorf("generated cron offset=%d, want %d", got, testCronMinute)
+			}
+		})
+	}
+}
+
+func TestUFWCloudflareRejectsUnsafeCronPathBeforeSystemInspection(t *testing.T) {
+	for _, path := range []string{"", "./ft", "/opt/ft%job", "/opt/ft\njob", "/opt/ft\rjob", "/opt/ft\x00job"} {
+		t.Run(fmt.Sprintf("%q", path), func(t *testing.T) {
+			recorder := newUFWRecorder()
+			recorder.executablePath = path
+			_, err := executeUFW(t, recorder, "cloudflare")
+			if err == nil || !strings.Contains(err.Error(), "cron-safe") {
+				t.Fatalf("Execute() error=%v, want cron-safe path error", err)
+			}
+			if len(recorder.commands) != 0 || len(recorder.queries) != 0 || len(recorder.fetchCalls) != 0 || len(recorder.outputCalls) != 0 {
+				t.Error("unsafe executable path caused system inspection or modification")
+			}
+		})
+	}
+}
+
+func TestParseCronMinute(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry string
+		want  int
+	}{
+		{name: "hourly migration", entry: "17 * * * * root /usr/local/bin/ft ufw cloudflare", want: 17},
+		{name: "new offset zero", entry: "0-59/10 * * * * root /usr/local/bin/ft ufw cloudflare", want: 0},
+		{name: "new offset nine", entry: "9-59/10 * * * * root /usr/local/bin/ft ufw cloudflare", want: 9},
+		{name: "step wildcard", entry: "*/10 * * * * root /usr/local/bin/ft ufw cloudflare", want: 0},
+		{name: "environment entries", entry: "SHELL=/bin/sh\nPATH=/usr/sbin:/usr/bin:/sbin:/bin\n3-59/10 * * * * root '/usr/local/bin/ft' ufw cloudflare", want: 3},
+		{name: "environment only", entry: "SHELL=/bin/sh\nPATH=/usr/sbin:/usr/bin:/sbin:/bin\n", want: -1},
+		{name: "quoted path", entry: `3-59/10 * * * * root '/opt/it'\''s #ft' ufw cloudflare`, want: 3},
+		{name: "comment", entry: "# 3-59/10 * * * * root /usr/local/bin/ft ufw cloudflare", want: -1},
+		{name: "invalid minute", entry: "60 * * * * root /usr/local/bin/ft ufw cloudflare", want: -1},
+		{name: "negative minute", entry: "-1 * * * * root /usr/local/bin/ft ufw cloudflare", want: -1},
+		{name: "invalid offset", entry: "10-59/10 * * * * root /usr/local/bin/ft ufw cloudflare", want: -1},
+		{name: "wrong range end", entry: "3-49/10 * * * * root /usr/local/bin/ft ufw cloudflare", want: -1},
+		{name: "wrong interval", entry: "3-59/15 * * * * root /usr/local/bin/ft ufw cloudflare", want: -1},
+		{name: "hour restriction", entry: "3-59/10 1 * * * root /usr/local/bin/ft ufw cloudflare", want: -1},
+		{name: "day restriction", entry: "17 * 1 * * root /usr/local/bin/ft ufw cloudflare", want: -1},
+		{name: "month restriction", entry: "17 * * 1 * root /usr/local/bin/ft ufw cloudflare", want: -1},
+		{name: "weekday restriction", entry: "17 * * * 1 root /usr/local/bin/ft ufw cloudflare", want: -1},
+		{name: "wrong user", entry: "17 * * * * nobody /usr/local/bin/ft ufw cloudflare", want: -1},
+		{name: "other command", entry: "17 * * * * root /usr/local/bin/ft ufw status", want: -1},
+		{name: "missing command", entry: "17 * * * * root # ufw cloudflare", want: -1},
+		{name: "command only in comment", entry: "17 * * * * root /usr/local/bin/ft # ufw cloudflare", want: -1},
+		{name: "unterminated path quote", entry: "17 * * * * root '/usr/local/bin/ft ufw cloudflare", want: -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseCronMinute(tt.entry); got != tt.want {
+				t.Errorf("parseCronMinute(%q) = %d, want %d", tt.entry, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -658,7 +814,7 @@ func TestUFWCloudflareCronRegistrationFailure(t *testing.T) {
 	recorder.runErrorAt = len(testSortedRanges) + 1 // first cron step, right after the reload
 	recorder.runErr = errors.New("read-only filesystem")
 	_, err := executeUFW(t, recorder, "cloudflare")
-	if err == nil || !strings.Contains(err.Error(), "registering the hourly refresh") {
+	if err == nil || !strings.Contains(err.Error(), "registering the 10-minute refresh") {
 		t.Fatalf("Execute() error = %v, want cron registration failure", err)
 	}
 	if strings.Contains(err.Error(), "may be blocked") {
@@ -697,7 +853,7 @@ func TestUFWStatusReportsEverything(t *testing.T) {
 		"Logging: on (low)",
 		"Startup at boot: enabled",
 		"ufw-docker: set up",
-		"registered (minute 41, /etc/cron.d/ft-ufw-cloudflare)",
+		"registered (every 10 minutes, offset 1, /etc/cron.d/ft-ufw-cloudflare)",
 		"[ 1] 22/tcp",
 		"[ 3] 80,443/tcp",
 		"3 rules total",
@@ -724,6 +880,36 @@ func TestUFWStatusWhenNotInstalled(t *testing.T) {
 	}
 	if len(recorder.outputCalls) != 0 {
 		t.Errorf("queried system state %v despite missing ufw", recorder.outputCalls)
+	}
+}
+
+func TestUFWStatusReportsLegacyHourlySchedule(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.cronFile = textResponse{content: "41 * * * * root /usr/local/bin/ft ufw cloudflare\n"}
+	output, err := executeUFW(t, recorder, "status")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(output, "hourly at minute 41") || !strings.Contains(output, "migrate to every 10 minutes") {
+		t.Errorf("output does not report the actual legacy schedule and migration guidance:\n%s", output)
+	}
+	if len(recorder.commands) != 0 {
+		t.Errorf("status ran commands %v, want none", recorder.commands)
+	}
+}
+
+func TestUFWStatusReportsUnrecognizedCronSchedule(t *testing.T) {
+	recorder := newUFWRecorder()
+	recorder.cronFile = textResponse{content: "17 3 * * * root /usr/local/bin/ft ufw cloudflare\n"}
+	output, err := executeUFW(t, recorder, "status")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(output, "unrecognized schedule") {
+		t.Errorf("output does not report the unrecognized cron schedule:\n%s", output)
+	}
+	if len(recorder.commands) != 0 {
+		t.Errorf("status ran commands %v, want none", recorder.commands)
 	}
 }
 

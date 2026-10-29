@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"runtime"
 	"strings"
 
@@ -23,6 +24,7 @@ type installDependencies struct {
 	dockerGroupUser func() (string, bool, error)
 	queryPackages   func(context.Context, ...string) (map[string]dpkgx.Status, error)
 	run             func(context.Context, []string, io.Reader) error
+	executable      func() (string, error)
 }
 
 func newInstallCmd(deps installDependencies) *cobra.Command {
@@ -134,13 +136,26 @@ Docker group membership.`,
 		},
 		&cobra.Command{
 			Use:   "nginx",
-			Short: "Install and start Nginx",
-			Args:  cobra.NoArgs,
+			Short: "Install Nginx with managed defaults and Cloudflare refresh",
+			Long: `Install and start Nginx, optimize recognized Ubuntu default configuration,
+and register a Cloudflare trusted-IP refresh every 10 minutes.
+
+Custom main configurations are refused rather than overwritten. Site files,
+firewall rules and TLS certificates are not changed. Use "ft nginx example"
+to print Go reverse-proxy and static-site configurations.`,
+			Args: cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, args []string) error {
 				if _, err := deps.detectOS(); err != nil {
 					return err
 				}
-				return runInstallPlan(cmd, "Nginx", installer.Nginx(), deps)
+				executable, err := deps.executable()
+				if err != nil {
+					return fmt.Errorf("resolving ft executable for Nginx configuration: %w", err)
+				}
+				return runInstallPlan(cmd, "Nginx", installer.Nginx(), deps, installer.Step{
+					Title: "Configuring Nginx defaults and Cloudflare refresh",
+					Argv:  []string{executable, "nginx", "configure"},
+				})
 			},
 		},
 		&cobra.Command{
@@ -242,5 +257,6 @@ func init() {
 		dockerGroupUser: userx.Invoking,
 		queryPackages:   dpkgx.Query,
 		run:             sysx.RunInputContext,
+		executable:      os.Executable,
 	}))
 }

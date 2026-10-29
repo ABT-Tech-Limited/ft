@@ -82,9 +82,22 @@ Ubuntu 24.04 使用 `noble` 源，Ubuntu 26.04 使用 `resolute` 源；当前支
 ft install nginx
 ```
 
-该命令从 Ubuntu 官方仓库安装 `nginx`，然后启动 `nginx.service` 并设为开机启动。它不会修改 UFW、防火墙、TLS 证书或站点配置。
+该命令从 Ubuntu 官方仓库安装 `nginx`，启动 `nginx.service` 并设为开机启动，然后自动执行 `ft nginx configure`：为可识别的 Ubuntu 默认配置应用基础优化，生成 Go 反代片段与 Cloudflare 信任名单，校验并应用成功后注册每 10 分钟同步任务。
 
-如果 `nginx` 包已完整安装，命令会跳过 apt 更新和包安装，不升级现有版本，只确保服务已启动并开机自启；缺失或半配置时才执行完整安装流程。
+如果 `nginx` 包已完整安装，命令会跳过 Nginx 的 apt 更新和包安装，不升级现有版本，但仍会检查优化配置和同步任务；缺失或半配置时执行完整安装流程。同步任务需要 `cron`，缺失或损坏时会单独通过 apt 安装/修复 `cron`，不会为补齐 cron 而升级已安装的 Nginx。
+
+默认优化包括自动 worker、每 worker 2048 个连接、隐藏版本、请求体上限 `10m`、普通代理读写空闲超时 `60s`、文本静态资源的 Gzip 设置。它兼容 Cloudflare Flexible 源站 HTTP 模式，不修改 TLS 证书、强制 HTTPS 跳转、UFW 或已有站点文件，也不会自动创建示例站点。
+
+ft 只接管可识别的 Ubuntu 24.04/26.04 默认主配置，或未被手动改动的 ft 托管配置；自定义主配置、非 ft 拥有的同名配置文件会被拒绝覆盖。配置变更会备份并执行 `nginx -t`，失败恢复托管文件，成功后平滑 reload。安装与配置是先后两个阶段，配置失败时软件包可能已经安装、服务可能已经启动，但命令不会误报整个安装流程成功。
+
+查看接入示例：
+
+```bash
+ft nginx example go
+ft nginx example static
+```
+
+命令只向标准输出打印示例，不联网、不写文件，也不要求 root。配置片段如何接入已有站点、缓存策略、同步失败处理见 [ft nginx](nginx.md)。
 
 ## 安装 ncdu
 
